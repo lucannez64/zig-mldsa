@@ -51,7 +51,7 @@ pub const zetas: [N]i32 = .{
 /// Output vector is in bitreversed order.
 /// Uses AVX2 acceleration when available.
 pub fn ntt(a: *[N]i32) void {
-    if (simd.has_avx2) {
+    if (simd.has_simd) {
         ntt_avx2.ntt(a);
     } else {
         nttScalar(a);
@@ -86,7 +86,7 @@ fn nttScalar(a: *[N]i32) void {
 /// Output coefficients are smaller than Q in absolute value.
 /// Uses AVX2 acceleration when available.
 pub fn invnttTomont(a: *[N]i32) void {
-    if (simd.has_avx2) {
+    if (simd.has_simd) {
         ntt_avx2.invnttTomont(a);
     } else {
         invnttTomontScalar(a);

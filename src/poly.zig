@@ -99,7 +99,7 @@ pub const Poly = struct {
     /// Uses AVX2 acceleration when available.
     pub fn pointwiseMontgomery(self: *Self, a: *const Self, b: *const Self) void {
         const simd = @import("simd.zig");
-        if (simd.has_avx2) {
+        if (simd.has_simd) {
             const reduce_avx2 = @import("reduce_avx2.zig");
             var i: usize = 0;
             while (i < N) : (i += 8) {

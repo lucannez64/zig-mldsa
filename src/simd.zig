@@ -18,6 +18,17 @@ pub const has_avx2 = blk: {
     break :blk builtin.cpu.features.isEnabled(@intFromEnum(std.Target.x86.Feature.avx2));
 };
 
+/// Check if WASM SIMD is available at compile time.
+pub const has_wasm_simd = blk: {
+    if (builtin.cpu.arch != .wasm32 and builtin.cpu.arch != .wasm64) {
+        break :blk false;
+    }
+    break :blk builtin.cpu.features.isEnabled(@intFromEnum(std.Target.wasm.Feature.simd128));
+};
+
+/// Generic SIMD availability check.
+pub const has_simd = has_avx2 or has_wasm_simd;
+
 /// Broadcast a scalar to all lanes.
 pub inline fn broadcast(x: i32) I32x8 {
     return @splat(x);
