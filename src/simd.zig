@@ -46,32 +46,18 @@ pub inline fn store(ptr: *[8]i32, v: I32x8) void {
 
 /// Widen i32x8 to i64x8 for multiplication.
 pub inline fn widen(v: I32x8) I64x8 {
-    const arr: [8]i32 = v;
-    var result: [8]i64 = undefined;
-    inline for (0..8) |i| {
-        result[i] = arr[i];
-    }
-    return result;
+    return @intCast(v);
 }
 
 /// Truncate i64x8 to i32x8 (low 32 bits).
 pub inline fn truncate64(v: I64x8) I32x8 {
-    const arr: [8]i64 = v;
-    var result: [8]i32 = undefined;
-    inline for (0..8) |i| {
-        result[i] = @truncate(arr[i]);
-    }
-    return result;
+    return @truncate(v);
 }
 
 /// Arithmetic right shift by 32 for i64x8.
 pub inline fn shr32(v: I64x8) I32x8 {
-    const arr: [8]i64 = v;
-    var result: [8]i32 = undefined;
-    inline for (0..8) |i| {
-        result[i] = @intCast(arr[i] >> 32);
-    }
-    return result;
+    const shifted = v >> @splat(32);
+    return @truncate(shifted);
 }
 
 /// Element-wise wrapping multiply i32 * i32 = i32 (low 32 bits).

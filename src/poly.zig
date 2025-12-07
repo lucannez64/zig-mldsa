@@ -195,6 +195,80 @@ pub const Poly = struct {
         }
     }
 
+    /// Sample 4 polynomials with uniformly random coefficients in [0, Q-1]
+    /// using parallel SHAKE128(seed || nonces).
+    pub fn uniform_4x(p0: *Self, p1: *Self, p2: *Self, p3: *Self, seed: *const [SEEDBYTES]u8, nonces: [4]u16) void {
+        const NBLOCKS = (768 + STREAM128_BLOCKBYTES - 1) / STREAM128_BLOCKBYTES;
+        const BUF_SIZE = NBLOCKS * STREAM128_BLOCKBYTES + 2;
+
+        var buf0: [BUF_SIZE]u8 = undefined;
+        var buf1: [BUF_SIZE]u8 = undefined;
+        var buf2: [BUF_SIZE]u8 = undefined;
+        var buf3: [BUF_SIZE]u8 = undefined;
+
+        var state = symmetric.Stream128x4State.init(seed, nonces);
+
+        state.squeezeBlocks(buf0[0 .. NBLOCKS * STREAM128_BLOCKBYTES], buf1[0 .. NBLOCKS * STREAM128_BLOCKBYTES], buf2[0 .. NBLOCKS * STREAM128_BLOCKBYTES], buf3[0 .. NBLOCKS * STREAM128_BLOCKBYTES]);
+
+        var buflen0: usize = NBLOCKS * STREAM128_BLOCKBYTES;
+        var buflen1: usize = NBLOCKS * STREAM128_BLOCKBYTES;
+        var buflen2: usize = NBLOCKS * STREAM128_BLOCKBYTES;
+        var buflen3: usize = NBLOCKS * STREAM128_BLOCKBYTES;
+
+        var ctr0 = rejUniform(p0.coeffs[0..], buf0[0..buflen0]);
+        var ctr1 = rejUniform(p1.coeffs[0..], buf1[0..buflen1]);
+        var ctr2 = rejUniform(p2.coeffs[0..], buf2[0..buflen2]);
+        var ctr3 = rejUniform(p3.coeffs[0..], buf3[0..buflen3]);
+
+        while (ctr0 < N or ctr1 < N or ctr2 < N or ctr3 < N) {
+            // Preserve leftovers
+            const off0 = buflen0 % 3;
+            for (0..off0) |i| buf0[i] = buf0[buflen0 - off0 + i];
+
+            const off1 = buflen1 % 3;
+            for (0..off1) |i| buf1[i] = buf1[buflen1 - off1 + i];
+
+            const off2 = buflen2 % 3;
+            for (0..off2) |i| buf2[i] = buf2[buflen2 - off2 + i];
+
+            const off3 = buflen3 % 3;
+            for (0..off3) |i| buf3[i] = buf3[buflen3 - off3 + i];
+
+            // We must squeeze into a temporary buffer if we want to write at offset?
+            // Stream128x4State.squeezeBlocks writes to slices.
+            // We can pass `buf0[off0..][0..STREAM128_BLOCKBYTES]`
+
+            var tmp0: [STREAM128_BLOCKBYTES]u8 = undefined;
+            var tmp1: [STREAM128_BLOCKBYTES]u8 = undefined;
+            var tmp2: [STREAM128_BLOCKBYTES]u8 = undefined;
+            var tmp3: [STREAM128_BLOCKBYTES]u8 = undefined;
+
+            state.squeezeBlocks(&tmp0, &tmp1, &tmp2, &tmp3);
+
+            @memcpy(buf0[off0..][0..STREAM128_BLOCKBYTES], &tmp0);
+            @memcpy(buf1[off1..][0..STREAM128_BLOCKBYTES], &tmp1);
+            @memcpy(buf2[off2..][0..STREAM128_BLOCKBYTES], &tmp2);
+            @memcpy(buf3[off3..][0..STREAM128_BLOCKBYTES], &tmp3);
+
+            if (ctr0 < N) {
+                buflen0 = STREAM128_BLOCKBYTES + off0;
+                ctr0 += rejUniform(p0.coeffs[ctr0..], buf0[0..buflen0]);
+            }
+            if (ctr1 < N) {
+                buflen1 = STREAM128_BLOCKBYTES + off1;
+                ctr1 += rejUniform(p1.coeffs[ctr1..], buf1[0..buflen1]);
+            }
+            if (ctr2 < N) {
+                buflen2 = STREAM128_BLOCKBYTES + off2;
+                ctr2 += rejUniform(p2.coeffs[ctr2..], buf2[0..buflen2]);
+            }
+            if (ctr3 < N) {
+                buflen3 = STREAM128_BLOCKBYTES + off3;
+                ctr3 += rejUniform(p3.coeffs[ctr3..], buf3[0..buflen3]);
+            }
+        }
+    }
+
     /// Sample polynomial with uniformly random coefficients in [-ETA, ETA]
     /// using SHAKE256(seed || nonce).
     pub fn uniformEta(self: *Self, seed: *const [CRHBYTES]u8, nonce: u16) void {

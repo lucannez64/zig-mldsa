@@ -28,6 +28,7 @@ const errors = crypto.errors;
 // Internal modules
 const sign_mod = @import("sign.zig");
 const packing = @import("packing.zig");
+pub const simd = @import("simd.zig");
 
 /// Signing mode configuration.
 pub const SigningMode = sign_mod.SigningMode;

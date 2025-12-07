@@ -73,12 +73,28 @@ pub const PolyVecL = struct {
     /// Pointwise multiply vectors and accumulate with Montgomery reduction.
     /// w = sum(u[i] * v[i]) * 2^{-32}
     pub fn pointwiseAccMontgomery(w: *Poly, u: *const Self, v: *const Self) void {
-        w.pointwiseMontgomery(&u.vec[0], &v.vec[0]);
+        const simd = @import("simd.zig");
+        if (simd.has_simd) {
+            const reduce_avx2 = @import("reduce_avx2.zig");
+            var i: usize = 0;
+            while (i < params.N) : (i += 8) {
+                var sum = simd.broadcast(0);
+                inline for (0..L) |j| {
+                    const va = simd.load(@ptrCast(&u.vec[j].coeffs[i]));
+                    const vb = simd.load(@ptrCast(&v.vec[j].coeffs[i]));
+                    const prod = reduce_avx2.pointwiseMont8(va, vb);
+                    sum = sum + prod;
+                }
+                simd.store(@ptrCast(&w.coeffs[i]), sum);
+            }
+        } else {
+            w.pointwiseMontgomery(&u.vec[0], &v.vec[0]);
 
-        var t: Poly = .{};
-        for (1..L) |i| {
-            t.pointwiseMontgomery(&u.vec[i], &v.vec[i]);
-            w.add(w, &t);
+            var t: Poly = .{};
+            for (1..L) |i| {
+                t.pointwiseMontgomery(&u.vec[i], &v.vec[i]);
+                w.add(w, &t);
+            }
         }
     }
 
@@ -224,11 +240,34 @@ pub const Mat = struct {
     /// Expand matrix A from seed rho using SHAKE128.
     /// Generates uniformly random coefficients via rejection sampling.
     pub fn expand(self: *Self, rho: *const [SEEDBYTES]u8) void {
-        for (&self.rows, 0..) |*row, i| {
-            for (&row.vec, 0..) |*p, j| {
-                const nonce: u16 = (@as(u16, @intCast(i)) << 8) + @as(u16, @intCast(j));
-                p.uniform(rho, nonce);
-            }
+        const total = K * L;
+        var idx: usize = 0;
+
+        // Process 4 polynomials at a time using parallel SHAKE
+        while (idx + 4 <= total) : (idx += 4) {
+            const idx0 = idx / L;
+            const j0 = idx % L;
+            const idx1 = (idx + 1) / L;
+            const j1 = (idx + 1) % L;
+            const idx2 = (idx + 2) / L;
+            const j2 = (idx + 2) % L;
+            const idx3 = (idx + 3) / L;
+            const j3 = (idx + 3) % L;
+
+            const nonce0: u16 = (@as(u16, @intCast(idx0)) << 8) + @as(u16, @intCast(j0));
+            const nonce1: u16 = (@as(u16, @intCast(idx1)) << 8) + @as(u16, @intCast(j1));
+            const nonce2: u16 = (@as(u16, @intCast(idx2)) << 8) + @as(u16, @intCast(j2));
+            const nonce3: u16 = (@as(u16, @intCast(idx3)) << 8) + @as(u16, @intCast(j3));
+
+            Poly.uniform_4x(&self.rows[idx0].vec[j0], &self.rows[idx1].vec[j1], &self.rows[idx2].vec[j2], &self.rows[idx3].vec[j3], rho, .{ nonce0, nonce1, nonce2, nonce3 });
+        }
+
+        // Handle remaining polynomials
+        while (idx < total) : (idx += 1) {
+            const i = idx / L;
+            const j = idx % L;
+            const nonce: u16 = (@as(u16, @intCast(i)) << 8) + @as(u16, @intCast(j));
+            self.rows[i].vec[j].uniform(rho, nonce);
         }
     }
 
