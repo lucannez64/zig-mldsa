@@ -7,6 +7,7 @@ const poly_mod = @import("poly.zig");
 const polyvec_mod = @import("polyvec.zig");
 const packing = @import("packing.zig");
 const config = @import("config.zig");
+const simd = @import("simd.zig");
 
 const K = params.K;
 const L = params.L;
@@ -165,7 +166,9 @@ pub fn sign(
     } else {
         @memset(&rnd, 0);
     }
-
+    if (simd.has_simd) {
+        return signInternalOptimized(sk, msg, pre[0 .. 2 + ctx.len], &rnd);
+    }
     return signInternal(sk, msg, pre[0 .. 2 + ctx.len], &rnd);
 }
 
@@ -293,6 +296,356 @@ fn signInternal(
     }
 
     return sig;
+}
+
+// --- Data Structures for Fast Convolution ---
+
+const ExtendedPoly = struct {
+    data: [2 * N]i32,
+
+    /// SIMD-optimized initialization of the [-s, s] buffer.
+    fn init(s: *const Poly) ExtendedPoly {
+        var self: ExtendedPoly = undefined;
+        // We process in chunks of 8 to use SIMD stores/negation.
+        var i: usize = 0;
+        while (i < N) : (i += 8) {
+            const v = simd.load(@ptrCast(&s.coeffs[i]));
+            // Store -s at index i
+            const neg_v = simd.broadcast(0) - v;
+            simd.store(@ptrCast(&self.data[i]), neg_v);
+            // Store s at index N+i
+            simd.store(@ptrCast(&self.data[N + i]), v);
+        }
+        return self;
+    }
+};
+
+const ExtendedPolyVecK = struct {
+    vec: [K]ExtendedPoly,
+
+    fn init(s: *const PolyVecK) ExtendedPolyVecK {
+        var self: ExtendedPolyVecK = undefined;
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            self.vec[k] = ExtendedPoly.init(&s.vec[k]);
+        }
+        return self;
+    }
+};
+
+const ExtendedPolyVecL = struct {
+    vec: [L]ExtendedPoly,
+
+    fn init(s: *const PolyVecL) ExtendedPolyVecL {
+        var self: ExtendedPolyVecL = undefined;
+        var l: usize = 0;
+        while (l < L) : (l += 1) {
+            self.vec[l] = ExtendedPoly.init(&s.vec[l]);
+        }
+        return self;
+    }
+};
+
+// --- Optimized Signing Function ---
+
+fn signInternalOptimized(
+    sk: *const packing.SecretKey,
+    msg: []const u8,
+    pre: []const u8,
+    rnd: *const [RNDBYTES]u8,
+) [CRYPTO_BYTES]u8 {
+    // Expand matrix
+    var mat: Mat = .{};
+    mat.expand(&sk.rho);
+
+    // 1. PRE-COMPUTATION (SIMD Optimized)
+    const s1_expanded = ExtendedPolyVecL.init(&sk.s1);
+    const s2_expanded = ExtendedPolyVecK.init(&sk.s2);
+
+    // t0 is needed in NTT form for the final Hint check.
+    var t0_ntt = sk.t0;
+    t0_ntt.ntt();
+
+    // Hashing setup
+    var mu: [CRHBYTES]u8 = undefined;
+    defer @memset(&mu, 0);
+    {
+        var hasher = Shake256.init(.{});
+        hasher.update(&sk.tr);
+        hasher.update(pre);
+        hasher.update(msg);
+        hasher.squeeze(&mu);
+    }
+
+    var rhoprime: [CRHBYTES]u8 = undefined;
+    defer @memset(&rhoprime, 0);
+    {
+        var hasher = Shake256.init(.{});
+        hasher.update(&sk.key);
+        hasher.update(rnd);
+        hasher.update(&mu);
+        hasher.squeeze(&rhoprime);
+    }
+
+    var nonce: u16 = 0;
+    var sig: [CRYPTO_BYTES]u8 = undefined;
+
+    // Output buffers
+    var z_final: PolyVecL = undefined;
+    var h_final: PolyVecK = undefined;
+    var c_tilde_final: [CTILDEBYTES]u8 = undefined;
+
+    // Rejection sampling loop
+    while (true) {
+        // Sample intermediate vector y
+        var y: PolyVecL = .{};
+        y.uniformGamma1(&rhoprime, nonce);
+        nonce += 1;
+
+        // Matrix-vector multiplication (A * y)
+        var z = y;
+        z.ntt();
+
+        var w1: PolyVecK = .{};
+        Mat.pointwiseMontgomery(&w1, &mat, &z);
+        w1.reduce();
+        w1.invnttTomont();
+
+        // Decompose w
+        w1.caddQ();
+        var w0: PolyVecK = .{};
+        PolyVecK.decompose(&w1, &w0, &w1);
+
+        var w1_packed: [@as(usize, K) * POLYW1_PACKEDBYTES]u8 = undefined;
+        w1.packW1(&w1_packed);
+
+        // Challenge Generation
+        var c_tilde: [CTILDEBYTES]u8 = undefined;
+        {
+            var hasher = Shake256.init(.{});
+            hasher.update(&mu);
+            hasher.update(&w1_packed);
+            hasher.squeeze(&c_tilde);
+        }
+
+        var cp: Poly = .{};
+        cp.challenge(&c_tilde);
+
+        // Parse sparse coefficients
+        var c_idx: [60]u16 = undefined;
+        var c_sgn: [60]i8 = undefined;
+        const c_count = getSparseCoeffs(&cp, &c_idx, &c_sgn);
+
+        // ---------------------------------------------------------
+        // PSPM-TEE: Optimized Checks (Unrolled)
+        // ---------------------------------------------------------
+
+        // 2. CHECK r0 = LowBits(w - cs2)
+        if (!pspmCheckNormDiffUnrolled(&c_idx, &c_sgn, c_count, &s2_expanded, &w0, GAMMA2 - BETA)) {
+            continue;
+        }
+
+        // 3. CHECK z = y + cs1
+        if (!pspmCheckNormSumUnrolled(&c_idx, &c_sgn, c_count, &s1_expanded, &y, GAMMA1 - BETA, &z_final)) {
+            continue;
+        }
+
+        // ---------------------------------------------------------
+        // Final Hint Check
+        // ---------------------------------------------------------
+        cp.ntt();
+
+        var ct0: PolyVecK = .{};
+        ct0.pointwisePolyMontgomery(&cp, &t0_ntt);
+        ct0.invnttTomont();
+        ct0.reduce();
+
+        if (!ct0.chknorm(GAMMA2)) continue;
+
+        // Recompute rigorous r using optimized diff
+        var r_val: PolyVecK = undefined;
+        pspmComputeDiffUnrolled(&c_idx, &c_sgn, c_count, &s2_expanded, &w0, &r_val);
+        r_val.add(&r_val, &ct0);
+
+        const n = PolyVecK.makeHint(&h_final, &r_val, &w1);
+        if (n > OMEGA) continue;
+
+        c_tilde_final = c_tilde;
+        break;
+    }
+
+    packing.packSig(&sig, &c_tilde_final, &z_final, &h_final);
+    return sig;
+}
+
+// ------------------------------------------------------------------------
+// UNROLLED SIMD PSPM Functions
+// ------------------------------------------------------------------------
+
+fn getSparseCoeffs(c: *const Poly, indices: *[60]u16, signs: *[60]i8) usize {
+    var count: usize = 0;
+    for (c.coeffs, 0..) |coeff, i| {
+        if (coeff != 0) {
+            indices[count] = @intCast(i);
+            signs[count] = @intCast(coeff);
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// PSPM Check r0.
+/// Unrolled 4x (32 coefficients per iteration).
+fn pspmCheckNormDiffUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usize, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
+    var k: usize = 0;
+    while (k < K) : (k += 1) {
+        const s_data = &s_expanded.vec[k].data;
+        const w0_coeffs = &w0.vec[k].coeffs;
+
+        // Iterate in chunks of 32 coefficients (4 SIMD registers)
+        var i: usize = 0;
+        while (i < N) : (i += 32) {
+            // Load w0 chunks
+            var acc0: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            var acc1: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            var acc2: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            var acc3: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+
+            // Sparse Accumulation Loop
+            var j: usize = 0;
+            while (j < c_count) : (j += 1) {
+                const p = c_idx[j];
+                const sgn = c_sgn[j];
+                const offset = N + i - p;
+
+                // Load 4 contiguous vectors from extended s buffer
+                // This maximizes memory bandwidth utilization
+                const s0 = simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                const s1 = simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                const s2 = simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                const s3 = simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+
+                if (sgn == 1) {
+                    acc0 = acc0 - s0;
+                    acc1 = acc1 - s1;
+                    acc2 = acc2 - s2;
+                    acc3 = acc3 - s3;
+                } else {
+                    acc0 = acc0 + s0;
+                    acc1 = acc1 + s1;
+                    acc2 = acc2 + s2;
+                    acc3 = acc3 + s3;
+                }
+            }
+
+            // Check results
+            if (simd.anyGe(simd.abs(acc0), limit)) return false;
+            if (simd.anyGe(simd.abs(acc1), limit)) return false;
+            if (simd.anyGe(simd.abs(acc2), limit)) return false;
+            if (simd.anyGe(simd.abs(acc3), limit)) return false;
+        }
+    }
+    return true;
+}
+
+/// PSPM Check z.
+/// Unrolled 4x.
+fn pspmCheckNormSumUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usize, s_expanded: *const ExtendedPolyVecL, y: *const PolyVecL, limit: i32, z_out: *PolyVecL) bool {
+    var l: usize = 0;
+    while (l < L) : (l += 1) {
+        const s_data = &s_expanded.vec[l].data;
+        const y_coeffs = &y.vec[l].coeffs;
+        var z_coeffs = &z_out.vec[l].coeffs;
+
+        var i: usize = 0;
+        while (i < N) : (i += 32) {
+            var acc0: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 0 ..].ptr));
+            var acc1: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 8 ..].ptr));
+            var acc2: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
+            var acc3: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
+
+            var j: usize = 0;
+            while (j < c_count) : (j += 1) {
+                const p = c_idx[j];
+                const sgn = c_sgn[j];
+                const offset = N + i - p;
+
+                const s0 = simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                const s1 = simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                const s2 = simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                const s3 = simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+
+                if (sgn == 1) {
+                    acc0 = acc0 + s0;
+                    acc1 = acc1 + s1;
+                    acc2 = acc2 + s2;
+                    acc3 = acc3 + s3;
+                } else {
+                    acc0 = acc0 - s0;
+                    acc1 = acc1 - s1;
+                    acc2 = acc2 - s2;
+                    acc3 = acc3 - s3;
+                }
+            }
+
+            if (simd.anyGe(simd.abs(acc0), limit)) return false;
+            if (simd.anyGe(simd.abs(acc1), limit)) return false;
+            if (simd.anyGe(simd.abs(acc2), limit)) return false;
+            if (simd.anyGe(simd.abs(acc3), limit)) return false;
+
+            simd.store(@ptrCast(z_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(z_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(z_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(z_coeffs[i + 24 ..].ptr), acc3);
+        }
+    }
+    return true;
+}
+
+fn pspmComputeDiffUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usize, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, dest: *PolyVecK) void {
+    var k: usize = 0;
+    while (k < K) : (k += 1) {
+        const s_data = &s_expanded.vec[k].data;
+        const w0_coeffs = &w0.vec[k].coeffs;
+        var d_coeffs = &dest.vec[k].coeffs;
+
+        var i: usize = 0;
+        while (i < N) : (i += 32) {
+            var acc0: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            var acc1: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            var acc2: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            var acc3: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+
+            var j: usize = 0;
+            while (j < c_count) : (j += 1) {
+                const p = c_idx[j];
+                const sgn = c_sgn[j];
+                const offset = N + i - p;
+
+                const s0 = simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                const s1 = simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                const s2 = simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                const s3 = simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+
+                if (sgn == 1) {
+                    acc0 = acc0 - s0;
+                    acc1 = acc1 - s1;
+                    acc2 = acc2 - s2;
+                    acc3 = acc3 - s3;
+                } else {
+                    acc0 = acc0 + s0;
+                    acc1 = acc1 + s1;
+                    acc2 = acc2 + s2;
+                    acc3 = acc3 + s3;
+                }
+            }
+
+            simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
+        }
+    }
 }
 
 /// Verify a signature with optional context.

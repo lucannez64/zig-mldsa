@@ -21,53 +21,39 @@ pub const PolyVecL = struct {
 
     /// Sample vector with uniformly random coefficients in [-ETA, ETA].
     pub fn uniformEta(self: *Self, seed: *const [CRHBYTES]u8, nonce: u16) void {
-        for (&self.vec, 0..) |*p, i| {
-            p.uniformEta(seed, nonce + @as(u16, @intCast(i)));
-        }
+        inline for (&self.vec, 0..) |*p, i| p.uniformEta(seed, nonce + @as(u16, @intCast(i)));
     }
 
     /// Sample vector with uniformly random coefficients in [-(GAMMA1-1), GAMMA1].
     pub fn uniformGamma1(self: *Self, seed: *const [CRHBYTES]u8, nonce: u16) void {
-        for (&self.vec, 0..) |*p, i| {
-            p.uniformGamma1(seed, @as(u16, L) * nonce + @as(u16, @intCast(i)));
-        }
+        inline for (&self.vec, 0..) |*p, i| p.uniformGamma1(seed, @as(u16, L) * nonce + @as(u16, @intCast(i)));
     }
 
     /// Reduce all coefficients to representatives in [-6283008, 6283008].
     pub fn reduce(self: *Self) void {
-        for (&self.vec) |*p| {
-            p.reduce();
-        }
+        inline for (&self.vec) |*p| p.reduce();
     }
 
     /// Add vectors: self = u + v. No modular reduction.
     pub fn add(self: *Self, u: *const Self, v: *const Self) void {
-        for (&self.vec, u.vec, v.vec) |*w, up, vp| {
-            w.add(&up, &vp);
-        }
+        inline for (&self.vec, u.vec, v.vec) |*w, up, vp| w.add(&up, &vp);
     }
 
     /// Forward NTT of all polynomials in vector.
     /// Output coefficients can be up to 16*Q larger than input.
     pub fn ntt(self: *Self) void {
-        for (&self.vec) |*p| {
-            p.ntt();
-        }
+        inline for (&self.vec) |*p| p.ntt();
     }
 
     /// Inverse NTT and multiplication by 2^{32} of all polynomials.
     pub fn invnttTomont(self: *Self) void {
-        for (&self.vec) |*p| {
-            p.invnttTomont();
-        }
+        inline for (&self.vec) |*p| p.invnttTomont();
     }
 
     /// Pointwise multiply all polynomials by a single polynomial with Montgomery reduction.
     /// r[i] = a * v[i] * 2^{-32}
     pub fn pointwisePolyMontgomery(self: *Self, a: *const Poly, v: *const Self) void {
-        for (&self.vec, v.vec) |*r, vp| {
-            r.pointwiseMontgomery(a, &vp);
-        }
+        inline for (&self.vec, v.vec) |*r, vp| r.pointwiseMontgomery(a, &vp);
     }
 
     /// Pointwise multiply vectors and accumulate with Montgomery reduction.

@@ -26,8 +26,27 @@ pub const has_wasm_simd = blk: {
     break :blk builtin.cpu.features.isEnabled(@intFromEnum(std.Target.wasm.Feature.simd128));
 };
 
+/// Check if ARM Neon is available at compile time.
+pub const has_neon = blk: {
+    if (builtin.cpu.arch == .aarch64) {
+        break :blk builtin.cpu.features.isEnabled(@intFromEnum(std.Target.aarch64.Feature.neon));
+    }
+    if (builtin.cpu.arch == .arm) {
+        break :blk builtin.cpu.features.isEnabled(@intFromEnum(std.Target.arm.Feature.neon));
+    }
+    break :blk false;
+};
+
+/// Check if RISC-V Vector extension is available at compile time.
+pub const has_riscv_v = blk: {
+    if (builtin.cpu.arch.isRISCV()) {
+        break :blk builtin.cpu.features.isEnabled(@intFromEnum(std.Target.riscv.Feature.v));
+    }
+    break :blk false;
+};
+
 /// Generic SIMD availability check.
-pub const has_simd = has_avx2 or has_wasm_simd;
+pub const has_simd = has_avx2 or has_wasm_simd or has_neon or has_riscv_v;
 
 /// Broadcast a scalar to all lanes.
 pub inline fn broadcast(x: i32) I32x8 {
@@ -37,6 +56,10 @@ pub inline fn broadcast(x: i32) I32x8 {
 /// Load 8 i32s from a slice.
 pub inline fn load(ptr: *const [8]i32) I32x8 {
     return ptr.*;
+}
+
+pub inline fn loadU(ptr: *const [8]i32) I32x8 {
+    return @as(*align(@alignOf(i32)) const I32x8, @ptrCast(ptr)).*;
 }
 
 /// Store 8 i32s to a slice.
@@ -68,6 +91,23 @@ pub inline fn mulLo(a: I32x8, b: I32x8) I32x8 {
 /// Element-wise full multiply i32 * i32 = i64.
 pub inline fn mulWide(a: I32x8, b: I32x8) I64x8 {
     return widen(a) * widen(b);
+}
+
+/// Compute absolute value of i32x8 (Bitwise trick: (v ^ mask) - mask).
+pub inline fn abs(v: I32x8) I32x8 {
+    // Arithmetic shift right to create a mask of all 1s (if neg) or 0s (if pos)
+    const mask = v >> @splat(31);
+    return (v ^ mask) -% mask;
+}
+
+/// Check if any element in vector 'v' is greater than or equal to 'scalar'.
+/// Maps to VPCMPGTD + VPMOVMSKB or similar on AVX2.
+pub inline fn anyGe(v: I32x8, scalar: i32) bool {
+    const threshold: I32x8 = @splat(scalar);
+    // resulting bool vector
+    const pred = v >= threshold;
+    // Horizontal OR reduction
+    return @reduce(.Or, pred);
 }
 
 test "simd broadcast and load" {

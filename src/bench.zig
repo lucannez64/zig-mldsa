@@ -23,16 +23,16 @@ pub fn main() !void {
 
 fn benchMlDsa(comptime MlDsa: type, name: []const u8, cpu_count: usize) !void {
     // // KeyGen
-    {
-        var ctx = struct {
-            pub fn run(_: *const @This()) void {
-                _ = MlDsa.KeyPair.generate(null);
-            }
-        }{};
-        var buf: [100]u8 = undefined;
-        const bench_name = try std.fmt.bufPrint(&buf, "BenchmarkKeyGen/{s}", .{name});
-        try runBenchmark(bench_name, cpu_count, &ctx);
-    }
+    // {
+    //     var ctx = struct {
+    //         pub fn run(_: *const @This()) void {
+    //             _ = MlDsa.KeyPair.generate(null);
+    //         }
+    //     }{};
+    //     var buf: [100]u8 = undefined;
+    //     const bench_name = try std.fmt.bufPrint(&buf, "BenchmarkKeyGen/{s}", .{name});
+    //     try runBenchmark(bench_name, cpu_count, &ctx);
+    // }
 
     // Sign
     {
@@ -51,28 +51,28 @@ fn benchMlDsa(comptime MlDsa: type, name: []const u8, cpu_count: usize) !void {
         try runBenchmark(bench_name, cpu_count, &ctx);
     }
 
-    // Verify
-    {
-        const kp = MlDsa.KeyPair.generate(null);
-        const msg = "Hello, World!";
-        const sig = try kp.secret_key.sign(msg, "");
+    // // Verify
+    // {
+    //     const kp = MlDsa.KeyPair.generate(null);
+    //     const msg = "Hello, World!";
+    //     const sig = try kp.secret_key.sign(msg, "");
 
-        var ctx = struct {
-            pk: MlDsa.PublicKey,
-            msg: []const u8,
-            sig: @TypeOf(sig),
-            pub fn run(self: *const @This()) void {
-                self.pk.verify(self.msg, "", &self.sig) catch unreachable;
-            }
-        }{
-            .pk = kp.public_key,
-            .msg = msg,
-            .sig = sig,
-        };
-        var buf: [100]u8 = undefined;
-        const bench_name = try std.fmt.bufPrint(&buf, "BenchmarkVerify/{s}", .{name});
-        try runBenchmark(bench_name, cpu_count, &ctx);
-    }
+    //     var ctx = struct {
+    //         pk: MlDsa.PublicKey,
+    //         msg: []const u8,
+    //         sig: @TypeOf(sig),
+    //         pub fn run(self: *const @This()) void {
+    //             self.pk.verify(self.msg, "", &self.sig) catch unreachable;
+    //         }
+    //     }{
+    //         .pk = kp.public_key,
+    //         .msg = msg,
+    //         .sig = sig,
+    //     };
+    //     var buf: [100]u8 = undefined;
+    //     const bench_name = try std.fmt.bufPrint(&buf, "BenchmarkVerify/{s}", .{name});
+    //     try runBenchmark(bench_name, cpu_count, &ctx);
+    // }
 }
 
 fn runBenchmark(name: []const u8, cpu_count: usize, ctx: anytype) !void {
@@ -82,7 +82,7 @@ fn runBenchmark(name: []const u8, cpu_count: usize, ctx: anytype) !void {
     var elapsed: u64 = 0;
 
     // Aim for 1 second
-    const target_ns = 1 * std.time.ns_per_s;
+    const target_ns = 10 * std.time.ns_per_s;
 
     while (true) {
         timer.reset();
