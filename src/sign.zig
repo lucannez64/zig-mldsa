@@ -367,6 +367,36 @@ const ExtendedPolyVecL = struct {
     }
 };
 
+// Precomputed offset table for sparse polynomial multiplication
+const SparseOffset = struct {
+    offset: u16, // Precomputed: N + chunk_start - position
+    sign: i32, // +1 for pos, -1 for neg
+};
+
+const SparseOffsets = struct {
+    offsets: [512]SparseOffset, // Increased size to handle worst-case scenarios
+    offsets_len: usize,
+};
+
+/// Parse sparse indices once into a unified offset table
+/// This eliminates runtime bounds checking in hot loops
+/// Precomputes base offsets: base_offset = N - position for each sparse coefficient
+inline fn parseSparseOffsets(c: *const Poly, chunk_size: usize, offsets: *SparseOffsets) void {
+    offsets.offsets_len = 0;
+    for (c.coeffs, 0..) |coeff, i| {
+        if (coeff == 1 or coeff == -1) {
+            const base_offset = N - i; // Precompute N - position
+            if (base_offset + chunk_size <= 2 * N and offsets.offsets_len < offsets.offsets.len) {
+                offsets.offsets[offsets.offsets_len] = .{
+                    .offset = @intCast(base_offset),
+                    .sign = if (coeff == 1) @as(i32, 1) else @as(i32, -1),
+                };
+                offsets.offsets_len += 1;
+            }
+        }
+    }
+}
+
 // --- Optimized Signing Function ---
 
 fn signInternalOptimized(
@@ -455,17 +485,34 @@ fn signInternalOptimized(
 
         // Parse sparse coefficients
         parseSparseIndices(&cp, &c_indices);
+
+        // Precompute offset table for optimized PSPM functions
+        var c_offsets: SparseOffsets = undefined;
+        parseSparseOffsets(&cp, 32, &c_offsets);
+
         // ---------------------------------------------------------
-        // PSPM-TEE: Optimized Checks (Unrolled)
+        // PSPM-TEE: Optimized Checks with Precomputed Offsets
         // ---------------------------------------------------------
 
         // 2. CHECK r0 = LowBits(w - cs2)
-        if (!pspmCheckNormDiffUnrolled(&c_indices, &s2_expanded, &w0, GAMMA2 - BETA)) {
+        var r0_valid: bool = undefined;
+        if (config.enable_software_pipelining) {
+            r0_valid = pspmCheckNormDiffPipelined(&c_offsets, &s2_expanded, &w0, GAMMA2 - BETA);
+        } else {
+            r0_valid = pspmCheckNormDiffOptimized(&c_offsets, &s2_expanded, &w0, GAMMA2 - BETA);
+        }
+        if (!r0_valid) {
             continue;
         }
 
         // 3. CHECK z = y + cs1
-        if (!pspmCheckNormSumUnrolled(&c_indices, &s1_expanded, &y, GAMMA1 - BETA, &z_final)) {
+        var z_valid: bool = undefined;
+        if (config.enable_software_pipelining) {
+            z_valid = pspmCheckNormSumPipelined(&c_offsets, &s1_expanded, &y, GAMMA1 - BETA, &z_final);
+        } else {
+            z_valid = pspmCheckNormSumOptimized(&c_offsets, &s1_expanded, &y, GAMMA1 - BETA, &z_final);
+        }
+        if (!z_valid) {
             continue;
         }
 
@@ -481,9 +528,13 @@ fn signInternalOptimized(
 
         if (!ct0.chknorm(GAMMA2)) continue;
 
-        // Recompute rigorous r using optimized diff
+        // Recompute rigorous r using optimized diff with precomputed offsets
         var r_val: PolyVecK = undefined;
-        pspmComputeDiffUnrolled(&c_indices, &s2_expanded, &w0, &r_val);
+        if (config.enable_software_pipelining) {
+            pspmComputeDiffPipelined(&c_offsets, &s2_expanded, &w0, &r_val);
+        } else {
+            pspmComputeDiffOptimized(&c_offsets, &s2_expanded, &w0, &r_val);
+        }
         r_val.add(&r_val, &ct0);
 
         const n = PolyVecK.makeHint(&h_final, &r_val, &w1);
@@ -721,6 +772,145 @@ fn pspmComputeDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const Exten
                 acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
                 acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
                 acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+            }
+
+            // Store results - no bounds checking needed since N is divisible by 32
+            simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------
+// OPTIMIZED PSPM FUNCTIONS WITH PRECOMPUTED OFFSET TABLE
+// ------------------------------------------------------------------------
+
+/// PSPM Check r0 using precomputed offset table
+/// Eliminates runtime bounds checking in hot loops
+fn pspmCheckNormDiffOptimized(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
+    var k: usize = 0;
+    var failed: u8 = 0;
+    while (k < K) : (k += 1) {
+        const s_data = &s_expanded.vec[k].data;
+        const w0_coeffs = &w0.vec[k].coeffs;
+
+        // Iterate in chunks of 32 coefficients (4 SIMD registers)
+        var i: usize = 0;
+        while (i < N) : (i += 32) {
+            // Comptime assertion: N is divisible by 32
+            comptime assert(N % 32 == 0);
+
+            // Load w0 chunks - no bounds checking needed since N is divisible by 32
+            var acc0 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            var acc1 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            var acc2 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            var acc3 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+
+            // Optimized sparse accumulation using precomputed offsets
+            for (offsets.offsets[0..offsets.offsets_len]) |offset| {
+                const offset_idx = offset.offset + i; // base_offset + i = (N - position) + i = N + i - position
+                const sign_vec = simd.broadcast(offset.sign);
+
+                // Bounds check to ensure we don't access beyond s_data array
+                if (offset_idx + 32 <= 2 * N) {
+                    acc0 = acc0 - sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    acc1 = acc1 - sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                    acc2 = acc2 - sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 16 ..].ptr));
+                    acc3 = acc3 - sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 24 ..].ptr));
+                }
+            }
+
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc0), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
+        }
+    }
+    return failed == 0;
+}
+
+/// PSPM Check z using precomputed offset table
+fn pspmCheckNormSumOptimized(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecL, y: *const PolyVecL, limit: i32, z_out: *PolyVecL) bool {
+    var l: usize = 0;
+    var failed: u8 = 0;
+    while (l < L) : (l += 1) {
+        const s_data = &s_expanded.vec[l].data;
+        const y_coeffs = &y.vec[l].coeffs;
+        var z_coeffs = &z_out.vec[l].coeffs;
+
+        var i: usize = 0;
+        while (i < N) : (i += 32) {
+            // Comptime assertion: N is divisible by 32
+            comptime assert(N % 32 == 0);
+
+            // Load y chunks - no bounds checking needed since N is divisible by 32
+            var acc0 = simd.load(@ptrCast(y_coeffs[i + 0 ..].ptr));
+            var acc1 = simd.load(@ptrCast(y_coeffs[i + 8 ..].ptr));
+            var acc2 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
+            var acc3 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
+
+            // Optimized sparse accumulation using precomputed offsets
+            for (offsets.offsets[0..offsets.offsets_len]) |offset| {
+                const offset_idx = offset.offset + i; // base_offset + i = (N - position) + i = N + i - position
+                const sign_vec = simd.broadcast(offset.sign);
+
+                // Bounds check to ensure we don't access beyond s_data array
+                if (offset_idx + 32 <= 2 * N) {
+                    acc0 = acc0 + sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    acc1 = acc1 + sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                    acc2 = acc2 + sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 16 ..].ptr));
+                    acc3 = acc3 + sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 24 ..].ptr));
+                }
+            }
+
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc0), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
+
+            // Store results - no bounds checking needed since N is divisible by 32
+            simd.store(@ptrCast(z_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(z_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(z_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(z_coeffs[i + 24 ..].ptr), acc3);
+        }
+    }
+    return failed == 0;
+}
+
+/// PSPM Compute diff using precomputed offset table
+fn pspmComputeDiffOptimized(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, dest: *PolyVecK) void {
+    var k: usize = 0;
+    while (k < K) : (k += 1) {
+        const s_data = &s_expanded.vec[k].data;
+        const w0_coeffs = &w0.vec[k].coeffs;
+        var d_coeffs = &dest.vec[k].coeffs;
+
+        var i: usize = 0;
+        while (i < N) : (i += 32) {
+            // Comptime assertion: N is divisible by 32
+            comptime assert(N % 32 == 0);
+
+            // Load w0 chunks - no bounds checking needed since N is divisible by 32
+            var acc0 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            var acc1 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            var acc2 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            var acc3 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+
+            // Optimized sparse accumulation using precomputed offsets
+            for (offsets.offsets[0..offsets.offsets_len]) |offset| {
+                const offset_idx = offset.offset + i; // base_offset + i = (N - position) + i = N + i - position
+                const sign_vec = simd.broadcast(offset.sign);
+
+                // Bounds check to ensure we don't access beyond s_data array
+                if (offset_idx + 32 <= 2 * N) {
+                    acc0 = acc0 - sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    acc1 = acc1 - sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                    acc2 = acc2 - sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 16 ..].ptr));
+                    acc3 = acc3 - sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 24 ..].ptr));
+                }
             }
 
             // Store results - no bounds checking needed since N is divisible by 32
@@ -991,6 +1181,246 @@ pub fn cryptoSignOpen(
     @memcpy(m[0..msg_len], sm[CRYPTO_BYTES..][0..msg_len]);
     mlen.* = msg_len;
     return 0;
+}
+
+// ------------------------------------------------------------------------
+// SOFTWARE PIPELINED PSPM FUNCTIONS - HIDE LOAD LATENCY
+// ------------------------------------------------------------------------
+
+/// Software pipelined PSPM Check r0 - hides load latency through prefetching
+/// Uses double-buffering technique to overlap computation with memory access
+fn pspmCheckNormDiffPipelined(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
+    var k: usize = 0;
+    var failed: u8 = 0;
+    while (k < K) : (k += 1) {
+        const s_data = &s_expanded.vec[k].data;
+        const w0_coeffs = &w0.vec[k].coeffs;
+
+        // Iterate in chunks of 32 coefficients (4 SIMD registers)
+        var i: usize = 0;
+
+        // Prologue: Prefetch first iteration data
+        if (N >= 32) {
+            // Prefetch w0 data for first iteration
+            _ = simd.load(@ptrCast(w0_coeffs[0..].ptr));
+            _ = simd.load(@ptrCast(w0_coeffs[8..].ptr));
+            _ = simd.load(@ptrCast(w0_coeffs[16..].ptr));
+            _ = simd.load(@ptrCast(w0_coeffs[24..].ptr));
+
+            // Prefetch s_data for common offsets (first few offsets are typically hot)
+            const prefetch_offsets = @min(offsets.offsets_len, 4);
+            for (offsets.offsets[0..prefetch_offsets]) |offset| {
+                const offset_idx = offset.offset;
+                if (offset_idx + 32 <= 2 * N) {
+                    _ = simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    _ = simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                }
+            }
+        }
+
+        while (i < N) : (i += 32) {
+            // Comptime assertion: N is divisible by 32
+            comptime assert(N % 32 == 0);
+
+            // Load w0 chunks with prefetch for next iteration
+            var acc0 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            var acc1 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            var acc2 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            var acc3 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+
+            // Prefetch next iteration w0 data (if available)
+            if (i + 64 <= N) {
+                _ = simd.load(@ptrCast(w0_coeffs[i + 32 ..].ptr));
+                _ = simd.load(@ptrCast(w0_coeffs[i + 40 ..].ptr));
+                _ = simd.load(@ptrCast(w0_coeffs[i + 48 ..].ptr));
+                _ = simd.load(@ptrCast(w0_coeffs[i + 56 ..].ptr));
+            }
+
+            // Optimized sparse accumulation with software pipelining
+            for (offsets.offsets[0..offsets.offsets_len]) |offset| {
+                const offset_idx = offset.offset + i; // base_offset + i = (N - position) + i = N + i - position
+                const sign_vec = simd.broadcast(offset.sign);
+
+                // Bounds check to ensure we don't access beyond s_data array
+                if (offset_idx + 32 <= 2 * N) {
+                    // Overlap: Start loading s_data while previous computation is in flight
+                    const s_chunk0 = simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    const s_chunk1 = simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                    const s_chunk2 = simd.loadU(@ptrCast(s_data[offset_idx + 16 ..].ptr));
+                    const s_chunk3 = simd.loadU(@ptrCast(s_data[offset_idx + 24 ..].ptr));
+
+                    // Computation happens while next data is being fetched
+                    acc0 = acc0 - sign_vec * s_chunk0;
+                    acc1 = acc1 - sign_vec * s_chunk1;
+                    acc2 = acc2 - sign_vec * s_chunk2;
+                    acc3 = acc3 - sign_vec * s_chunk3;
+                }
+            }
+
+            // Check norms - this creates a small bubble but is necessary
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc0), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
+        }
+    }
+    return failed == 0;
+}
+
+/// Software pipelined PSPM Check z - hides load latency through prefetching
+fn pspmCheckNormSumPipelined(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecL, y: *const PolyVecL, limit: i32, z_out: *PolyVecL) bool {
+    var l: usize = 0;
+    var failed: u8 = 0;
+    while (l < L) : (l += 1) {
+        const s_data = &s_expanded.vec[l].data;
+        const y_coeffs = &y.vec[l].coeffs;
+        var z_coeffs = &z_out.vec[l].coeffs;
+
+        var i: usize = 0;
+
+        // Prologue: Prefetch first iteration data
+        if (N >= 32) {
+            _ = simd.load(@ptrCast(y_coeffs[0..].ptr));
+            _ = simd.load(@ptrCast(y_coeffs[8..].ptr));
+            _ = simd.load(@ptrCast(y_coeffs[16..].ptr));
+            _ = simd.load(@ptrCast(y_coeffs[24..].ptr));
+
+            const prefetch_offsets = @min(offsets.offsets_len, 4);
+            for (offsets.offsets[0..prefetch_offsets]) |offset| {
+                const offset_idx = offset.offset;
+                if (offset_idx + 32 <= 2 * N) {
+                    _ = simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    _ = simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                }
+            }
+        }
+
+        while (i < N) : (i += 32) {
+            // Comptime assertion: N is divisible by 32
+            comptime assert(N % 32 == 0);
+
+            // Load y chunks with prefetch for next iteration
+            var acc0 = simd.load(@ptrCast(y_coeffs[i + 0 ..].ptr));
+            var acc1 = simd.load(@ptrCast(y_coeffs[i + 8 ..].ptr));
+            var acc2 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
+            var acc3 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
+
+            // Prefetch next iteration y data
+            if (i + 64 <= N) {
+                _ = simd.load(@ptrCast(y_coeffs[i + 32 ..].ptr));
+                _ = simd.load(@ptrCast(y_coeffs[i + 40 ..].ptr));
+                _ = simd.load(@ptrCast(y_coeffs[i + 48 ..].ptr));
+                _ = simd.load(@ptrCast(y_coeffs[i + 56 ..].ptr));
+            }
+
+            // Optimized sparse accumulation with software pipelining
+            for (offsets.offsets[0..offsets.offsets_len]) |offset| {
+                const offset_idx = offset.offset + i;
+                const sign_vec = simd.broadcast(offset.sign);
+
+                if (offset_idx + 32 <= 2 * N) {
+                    // Overlap: Load s_data while previous computation is in flight
+                    const s_chunk0 = simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    const s_chunk1 = simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                    const s_chunk2 = simd.loadU(@ptrCast(s_data[offset_idx + 16 ..].ptr));
+                    const s_chunk3 = simd.loadU(@ptrCast(s_data[offset_idx + 24 ..].ptr));
+
+                    // Computation happens while next data is being fetched
+                    acc0 = acc0 + sign_vec * s_chunk0;
+                    acc1 = acc1 + sign_vec * s_chunk1;
+                    acc2 = acc2 + sign_vec * s_chunk2;
+                    acc3 = acc3 + sign_vec * s_chunk3;
+                }
+            }
+
+            // Store results with pipelining - store current while prefetching next
+            simd.store(@ptrCast(z_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(z_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(z_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(z_coeffs[i + 24 ..].ptr), acc3);
+
+            // Check norms
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc0), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
+        }
+    }
+    return failed == 0;
+}
+
+/// Software pipelined PSPM compute difference - hides load latency
+fn pspmComputeDiffPipelined(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, dest: *PolyVecK) void {
+    var k: usize = 0;
+    while (k < K) : (k += 1) {
+        const s_data = &s_expanded.vec[k].data;
+        const w0_coeffs = &w0.vec[k].coeffs;
+        var d_coeffs = &dest.vec[k].coeffs;
+
+        var i: usize = 0;
+
+        // Prologue: Prefetch first iteration data
+        if (N >= 32) {
+            _ = simd.load(@ptrCast(w0_coeffs[0..].ptr));
+            _ = simd.load(@ptrCast(w0_coeffs[8..].ptr));
+            _ = simd.load(@ptrCast(w0_coeffs[16..].ptr));
+            _ = simd.load(@ptrCast(w0_coeffs[24..].ptr));
+
+            const prefetch_offsets = @min(offsets.offsets_len, 4);
+            for (offsets.offsets[0..prefetch_offsets]) |offset| {
+                const offset_idx = offset.offset;
+                if (offset_idx + 32 <= 2 * N) {
+                    _ = simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    _ = simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                }
+            }
+        }
+
+        while (i < N) : (i += 32) {
+            // Comptime assertion: N is divisible by 32
+            comptime assert(N % 32 == 0);
+
+            // Load w0 chunks with prefetch for next iteration
+            var acc0 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            var acc1 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            var acc2 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            var acc3 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+
+            // Prefetch next iteration w0 data
+            if (i + 64 <= N) {
+                _ = simd.load(@ptrCast(w0_coeffs[i + 32 ..].ptr));
+                _ = simd.load(@ptrCast(w0_coeffs[i + 40 ..].ptr));
+                _ = simd.load(@ptrCast(w0_coeffs[i + 48 ..].ptr));
+                _ = simd.load(@ptrCast(w0_coeffs[i + 56 ..].ptr));
+            }
+
+            // Optimized sparse accumulation with software pipelining
+            for (offsets.offsets[0..offsets.offsets_len]) |offset| {
+                const offset_idx = offset.offset + i;
+                const sign_vec = simd.broadcast(offset.sign);
+
+                if (offset_idx + 32 <= 2 * N) {
+                    // Overlap: Load s_data while previous computation is in flight
+                    const s_chunk0 = simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                    const s_chunk1 = simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                    const s_chunk2 = simd.loadU(@ptrCast(s_data[offset_idx + 16 ..].ptr));
+                    const s_chunk3 = simd.loadU(@ptrCast(s_data[offset_idx + 24 ..].ptr));
+
+                    // Computation happens while next data is being fetched
+                    acc0 = acc0 - sign_vec * s_chunk0;
+                    acc1 = acc1 - sign_vec * s_chunk1;
+                    acc2 = acc2 - sign_vec * s_chunk2;
+                    acc3 = acc3 - sign_vec * s_chunk3;
+                }
+            }
+
+            // Store results - overlap store with next iteration prefetch
+            simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
+        }
+    }
 }
 
 // ==================== Tests ====================

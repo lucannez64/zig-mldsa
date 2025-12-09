@@ -14,6 +14,12 @@ pub fn main() !void {
         std.debug.print("SIMD: disabled\n", .{});
     }
 
+    if (zgg.simd.has_avx512f) {
+        std.debug.print("AVX-512F: enabled\n", .{});
+    } else {
+        std.debug.print("AVX-512F: disabled\n", .{});
+    }
+
     const cpu_count = try std.Thread.getCpuCount();
 
     try benchMlDsa(zgg.MlDsa44, "ML-DSA44", cpu_count);
