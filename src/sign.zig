@@ -2,6 +2,7 @@
 //! ML-DSA (FIPS 204) implementation.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 /// Securely clear memory to prevent compiler optimization
 /// Uses volatile pointer to ensure memory write is not optimized away
@@ -642,96 +643,32 @@ fn pspmCheckNormSumUnrolled(c: *const SparsePolyIndices, s_expanded: *const Exte
 
         var i: usize = 0;
         while (i < N) : (i += 32) {
-            // Bounds check before SIMD operations
-            if (i + 32 > N) break;
+            // Comptime assertion: N is divisible by 32
+            comptime assert(N % 32 == 0);
 
-            // Load y chunks with bounds checking
-            var acc0: simd.I32x8 = undefined;
-            if (i + 8 <= N) {
-                acc0 = simd.load(@ptrCast(y_coeffs[i + 0 ..].ptr));
-            } else {
-                // Fallback for partial chunk
-                var temp: [8]i32 = undefined;
-                @memset(&temp, 0);
-                for (i + 0..@min(i + 8, N)) |j| {
-                    temp[j - (i + 0)] = y_coeffs[j];
-                }
-                acc0 = simd.load(@ptrCast(&temp));
-            }
+            // Load y chunks - no bounds checking needed since N is divisible by 32
+            var acc0 = simd.load(@ptrCast(y_coeffs[i + 0 ..].ptr));
+            var acc1 = simd.load(@ptrCast(y_coeffs[i + 8 ..].ptr));
+            var acc2 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
+            var acc3 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
 
-            var acc1: simd.I32x8 = undefined;
-            if (i + 16 <= N) {
-                acc1 = simd.load(@ptrCast(y_coeffs[i + 8 ..].ptr));
-            } else {
-                var temp: [8]i32 = undefined;
-                @memset(&temp, 0);
-                for (i + 8..@min(i + 16, N)) |j| {
-                    temp[j - (i + 8)] = y_coeffs[j];
-                }
-                acc1 = simd.load(@ptrCast(&temp));
-            }
-
-            var acc2: simd.I32x8 = undefined;
-            if (i + 24 <= N) {
-                acc2 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
-            } else {
-                var temp: [8]i32 = undefined;
-                @memset(&temp, 0);
-                for (i + 16..@min(i + 24, N)) |j| {
-                    temp[j - (i + 16)] = y_coeffs[j];
-                }
-                acc2 = simd.load(@ptrCast(&temp));
-            }
-
-            var acc3: simd.I32x8 = undefined;
-            if (i + 32 <= N) {
-                acc3 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
-            } else {
-                var temp: [8]i32 = undefined;
-                @memset(&temp, 0);
-                for (i + 24..@min(i + 32, N)) |j| {
-                    temp[j - (i + 24)] = y_coeffs[j];
-                }
-                acc3 = simd.load(@ptrCast(&temp));
-            }
-
-            // Sparse Accumulation Loop with bounds checking
+            // Sparse Accumulation Loop - optimized for performance
             for (c.pos[0..c.pos_len]) |p| {
                 const offset = N + i - p;
-                // Bounds check for s_data access
-                if (offset + 32 > 2 * N) continue;
-
-                if (offset + 8 <= 2 * N) {
-                    acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                }
-                if (offset + 16 <= 2 * N) {
-                    acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                }
-                if (offset + 24 <= 2 * N) {
-                    acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                }
-                if (offset + 32 <= 2 * N) {
-                    acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
-                }
+                // Since N is divisible by 32 and p <= TAU, offset is safe
+                acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
             }
 
             for (c.neg[0..c.neg_len]) |p| {
                 const offset = N + i - p;
-                // Bounds check for s_data access
-                if (offset + 32 > 2 * N) continue;
-
-                if (offset + 8 <= 2 * N) {
-                    acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                }
-                if (offset + 16 <= 2 * N) {
-                    acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                }
-                if (offset + 24 <= 2 * N) {
-                    acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                }
-                if (offset + 32 <= 2 * N) {
-                    acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
-                }
+                // Since N is divisible by 32 and p <= TAU, offset is safe
+                acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
             }
 
             failed |= @intFromBool(simd.anyGe(simd.abs(acc0), limit));
@@ -739,19 +676,11 @@ fn pspmCheckNormSumUnrolled(c: *const SparsePolyIndices, s_expanded: *const Exte
             failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
             failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
 
-            // Store results with bounds checking
-            if (i + 8 <= N) {
-                simd.store(@ptrCast(z_coeffs[i + 0 ..].ptr), acc0);
-            }
-            if (i + 16 <= N) {
-                simd.store(@ptrCast(z_coeffs[i + 8 ..].ptr), acc1);
-            }
-            if (i + 24 <= N) {
-                simd.store(@ptrCast(z_coeffs[i + 16 ..].ptr), acc2);
-            }
-            if (i + 32 <= N) {
-                simd.store(@ptrCast(z_coeffs[i + 24 ..].ptr), acc3);
-            }
+            // Store results - no bounds checking needed since N is divisible by 32
+            simd.store(@ptrCast(z_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(z_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(z_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(z_coeffs[i + 24 ..].ptr), acc3);
         }
     }
     return failed == 0;
@@ -766,111 +695,39 @@ fn pspmComputeDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const Exten
 
         var i: usize = 0;
         while (i < N) : (i += 32) {
-            // Bounds check before SIMD operations
-            if (i + 32 > N) break;
+            // Comptime assertion: N is divisible by 32
+            comptime assert(N % 32 == 0);
 
-            // Load w0 chunks with bounds checking
-            var acc0: simd.I32x8 = undefined;
-            if (i + 8 <= N) {
-                acc0 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
-            } else {
-                // Fallback for partial chunk
-                var temp: [8]i32 = undefined;
-                @memset(&temp, 0);
-                for (i + 0..@min(i + 8, N)) |j| {
-                    temp[j - (i + 0)] = w0_coeffs[j];
-                }
-                acc0 = simd.load(@ptrCast(&temp));
-            }
+            // Load w0 chunks - no bounds checking needed since N is divisible by 32
+            var acc0 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            var acc1 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            var acc2 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            var acc3 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
 
-            var acc1: simd.I32x8 = undefined;
-            if (i + 16 <= N) {
-                acc1 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
-            } else {
-                var temp: [8]i32 = undefined;
-                @memset(&temp, 0);
-                for (i + 8..@min(i + 16, N)) |j| {
-                    temp[j - (i + 8)] = w0_coeffs[j];
-                }
-                acc1 = simd.load(@ptrCast(&temp));
-            }
-
-            var acc2: simd.I32x8 = undefined;
-            if (i + 24 <= N) {
-                acc2 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
-            } else {
-                var temp: [8]i32 = undefined;
-                @memset(&temp, 0);
-                for (i + 16..@min(i + 24, N)) |j| {
-                    temp[j - (i + 16)] = w0_coeffs[j];
-                }
-                acc2 = simd.load(@ptrCast(&temp));
-            }
-
-            var acc3: simd.I32x8 = undefined;
-            if (i + 32 <= N) {
-                acc3 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
-            } else {
-                var temp: [8]i32 = undefined;
-                @memset(&temp, 0);
-                for (i + 24..@min(i + 32, N)) |j| {
-                    temp[j - (i + 24)] = w0_coeffs[j];
-                }
-                acc3 = simd.load(@ptrCast(&temp));
-            }
-
-            // Sparse Accumulation Loop with bounds checking
+            // Sparse Accumulation Loop - optimized for performance
             for (c.pos[0..c.pos_len]) |p| {
                 const offset = N + i - p;
-                // Bounds check for s_data access
-                if (offset + 32 > 2 * N) continue;
-
-                if (offset + 8 <= 2 * N) {
-                    acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                }
-                if (offset + 16 <= 2 * N) {
-                    acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                }
-                if (offset + 24 <= 2 * N) {
-                    acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                }
-                if (offset + 32 <= 2 * N) {
-                    acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
-                }
+                // Since N is divisible by 32 and p <= TAU, offset is safe
+                acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
             }
 
             for (c.neg[0..c.neg_len]) |p| {
                 const offset = N + i - p;
-                // Bounds check for s_data access
-                if (offset + 32 > 2 * N) continue;
-
-                if (offset + 8 <= 2 * N) {
-                    acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                }
-                if (offset + 16 <= 2 * N) {
-                    acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                }
-                if (offset + 24 <= 2 * N) {
-                    acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                }
-                if (offset + 32 <= 2 * N) {
-                    acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
-                }
+                // Since N is divisible by 32 and p <= TAU, offset is safe
+                acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
             }
 
-            // Store results with bounds checking
-            if (i + 8 <= N) {
-                simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
-            }
-            if (i + 16 <= N) {
-                simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
-            }
-            if (i + 24 <= N) {
-                simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
-            }
-            if (i + 32 <= N) {
-                simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
-            }
+            // Store results - no bounds checking needed since N is divisible by 32
+            simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
         }
     }
 }
