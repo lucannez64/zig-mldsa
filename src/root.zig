@@ -141,6 +141,9 @@ fn MlDsa(comptime p: Params) type {
                 ctx: []const u8,
                 sig: *const [signature_length]u8,
             ) SigningError!void {
+                // Validate inputs
+                if (msg.len > 1 << 30) return error.MessageTooLong;
+                if (ctx.len > 255) return error.ContextTooLong;
                 return sign_mod.verify(&self.pk, msg, ctx, sig);
             }
 
@@ -151,6 +154,7 @@ fn MlDsa(comptime p: Params) type {
 
             /// Deserializes a public key from bytes.
             pub fn fromBytes(bytes: *const [bytes_length]u8) PublicKey {
+                // Validate inputs - bytes length is enforced by type system
                 return .{
                     .pk = packing.PublicKey.fromBytes(bytes),
                 };
@@ -171,6 +175,9 @@ fn MlDsa(comptime p: Params) type {
                 msg: []const u8,
                 ctx: []const u8,
             ) SigningError![signature_length]u8 {
+                // Validate inputs
+                if (msg.len > 1 << 30) return error.MessageTooLong;
+                if (ctx.len > 255) return error.ContextTooLong;
                 return sign_mod.sign(&self.sk, msg, ctx);
             }
 
@@ -208,6 +215,7 @@ fn MlDsa(comptime p: Params) type {
                 pk_bytes: *const [public_key_length]u8,
                 sk_bytes: *const [secret_key_length]u8,
             ) KeyPair {
+                // Validate inputs - buffer lengths are enforced by type system
                 return .{
                     .public_key = PublicKey.fromBytes(pk_bytes),
                     .secret_key = SecretKey.fromBytes(sk_bytes),
@@ -222,6 +230,7 @@ fn MlDsa(comptime p: Params) type {
 
             /// Creates a new signer with the given secret key and context.
             pub fn init(secret_key: SecretKey, ctx: []const u8) SigningError!Signer {
+                // Validate inputs
                 if (ctx.len > 255) return error.ContextTooLong;
                 return .{
                     .secret_key = secret_key,
@@ -247,6 +256,7 @@ fn MlDsa(comptime p: Params) type {
                 ctx: []const u8,
                 sig: *const [signature_length]u8,
             ) SigningError!Verifier {
+                // Validate inputs
                 if (ctx.len > 255) return error.ContextTooLong;
                 return .{
                     .public_key = public_key,

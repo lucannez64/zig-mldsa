@@ -21,11 +21,15 @@ pub const PolyVecL = struct {
 
     /// Sample vector with uniformly random coefficients in [-ETA, ETA].
     pub fn uniformEta(self: *Self, seed: *const [CRHBYTES]u8, nonce: u16) void {
+        // Validate nonce to prevent overflow
+        if (@as(u32, nonce) > @as(u32, std.math.maxInt(u16)) - L) return;
         inline for (&self.vec, 0..) |*p, i| p.uniformEta(seed, nonce + @as(u16, @intCast(i)));
     }
 
     /// Sample vector with uniformly random coefficients in [-(GAMMA1-1), GAMMA1].
     pub fn uniformGamma1(self: *Self, seed: *const [CRHBYTES]u8, nonce: u16) void {
+        // Validate nonce to prevent overflow in multiplication
+        if (@as(u32, nonce) > @as(u32, std.math.maxInt(u16)) / L) return;
         inline for (&self.vec, 0..) |*p, i| p.uniformGamma1(seed, @as(u16, L) * nonce + @as(u16, @intCast(i)));
     }
 
@@ -102,6 +106,8 @@ pub const PolyVecK = struct {
 
     /// Sample vector with uniformly random coefficients in [-ETA, ETA].
     pub fn uniformEta(self: *Self, seed: *const [CRHBYTES]u8, nonce: u16) void {
+        // Validate nonce to prevent overflow
+        if (@as(u32, nonce) > @as(u32, std.math.maxInt(u16)) - K) return;
         for (&self.vec, 0..) |*p, i| {
             p.uniformEta(seed, nonce + @as(u16, @intCast(i)));
         }

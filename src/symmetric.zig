@@ -2,6 +2,16 @@
 //! Uses SHAKE128/SHAKE256 for stream generation.
 
 const std = @import("std");
+
+/// Securely clear memory to prevent compiler optimization
+/// Uses volatile pointer to ensure memory write is not optimized away
+fn secureClearBytes(ptr: []u8) void {
+    const volatile_ptr: [*]volatile u8 = @ptrCast(ptr.ptr);
+    for (0..ptr.len) |i| {
+        volatile_ptr[i] = 0;
+    }
+}
+
 const params = @import("params.zig");
 
 const SEEDBYTES = params.SEEDBYTES;
@@ -23,6 +33,7 @@ pub const Stream128State = struct {
     /// Initialize the stream with a seed and nonce.
     /// Absorbs: seed || nonce (little-endian)
     pub fn init(seed: *const [SEEDBYTES]u8, nonce: u16) Self {
+        // Validate inputs - seed is guaranteed non-null by type system
         var state = std.crypto.hash.sha3.Shake128.init(.{});
         state.update(seed);
         state.update(&std.mem.toBytes(std.mem.nativeToLittle(u16, nonce)));
@@ -58,6 +69,7 @@ pub const Stream256State = struct {
     /// Initialize the stream with a seed and nonce.
     /// Absorbs: seed || nonce (little-endian)
     pub fn init(seed: *const [CRHBYTES]u8, nonce: u16) Self {
+        // Validate inputs - seed is guaranteed non-null by type system
         var state = std.crypto.hash.sha3.Shake256.init(.{});
         state.update(seed);
         state.update(&std.mem.toBytes(std.mem.nativeToLittle(u16, nonce)));
@@ -114,7 +126,7 @@ pub const Stream128x4State = struct {
         };
 
         // Clear state
-        @memset(std.mem.asBytes(&self.state.s), 0);
+        secureClearBytes(std.mem.asBytes(&self.state.s));
 
         // Prepare input block: seed || nonce (little-endian)
         // Length = 32 + 2 = 34 bytes.

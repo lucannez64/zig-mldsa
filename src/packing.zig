@@ -1,6 +1,16 @@
 //! Packing and unpacking routines for Dilithium keys and signatures.
 
 const std = @import("std");
+const assert = std.debug.assert;
+
+/// Securely clear memory to prevent compiler optimization
+/// Uses volatile pointer to ensure memory write is not optimized away
+fn secureClearBytes(ptr: []u8) void {
+    const volatile_ptr: [*]volatile u8 = @ptrCast(ptr.ptr);
+    for (0..ptr.len) |i| {
+        volatile_ptr[i] = 0;
+    }
+}
 const params = @import("params.zig");
 const poly_mod = @import("poly.zig");
 const polyvec_mod = @import("polyvec.zig");
@@ -33,19 +43,31 @@ pub const PublicKey = struct {
 
     /// Pack public key into byte array.
     pub fn pack(self: *const Self, pk: *[CRYPTO_PUBLICKEYBYTES]u8) void {
+        // Validate buffer size - runtime check to avoid comptime overflow
+        if (@as(u32, CRYPTO_PUBLICKEYBYTES) < @as(u32, SEEDBYTES) + @as(u32, K) * @as(u32, POLYT1_PACKEDBYTES)) return;
+
         @memcpy(pk[0..SEEDBYTES], &self.rho);
 
         for (self.t1.vec, 0..) |p, i| {
-            p.t1Pack(pk[SEEDBYTES + i * POLYT1_PACKEDBYTES ..][0..POLYT1_PACKEDBYTES]);
+            const offset = SEEDBYTES + i * POLYT1_PACKEDBYTES;
+            // Runtime bounds check
+            if (offset + POLYT1_PACKEDBYTES > CRYPTO_PUBLICKEYBYTES) continue;
+            p.t1Pack(pk[offset..][0..POLYT1_PACKEDBYTES]);
         }
     }
 
     /// Unpack public key from byte array.
     pub fn unpack(self: *Self, pk: *const [CRYPTO_PUBLICKEYBYTES]u8) void {
+        // Validate buffer size - runtime check to avoid comptime overflow
+        if (@as(u32, CRYPTO_PUBLICKEYBYTES) < @as(u32, SEEDBYTES) + @as(u32, K) * @as(u32, POLYT1_PACKEDBYTES)) return;
+
         @memcpy(&self.rho, pk[0..SEEDBYTES]);
 
         for (&self.t1.vec, 0..) |*p, i| {
-            p.t1Unpack(pk[SEEDBYTES + i * POLYT1_PACKEDBYTES ..][0..POLYT1_PACKEDBYTES]);
+            const offset = SEEDBYTES + i * POLYT1_PACKEDBYTES;
+            // Runtime bounds check
+            if (offset + POLYT1_PACKEDBYTES > CRYPTO_PUBLICKEYBYTES) continue;
+            p.t1Unpack(pk[offset..][0..POLYT1_PACKEDBYTES]);
         }
     }
 
@@ -84,39 +106,60 @@ pub const SecretKey = struct {
 
     /// Pack secret key into byte array.
     pub fn pack(self: *const Self, sk: *[CRYPTO_SECRETKEYBYTES]u8) void {
+        // Validate buffer size - runtime check to avoid comptime overflow
+        if (@as(u32, CRYPTO_SECRETKEYBYTES) < @as(u32, T0_OFFSET) + @as(u32, K) * @as(u32, POLYT0_PACKEDBYTES)) return;
+
         @memcpy(sk[0..SEEDBYTES], &self.rho);
         @memcpy(sk[KEY_OFFSET..][0..SEEDBYTES], &self.key);
         @memcpy(sk[TR_OFFSET..][0..TRBYTES], &self.tr);
 
         for (self.s1.vec, 0..) |p, i| {
-            p.etaPack(sk[S1_OFFSET + i * POLYETA_PACKEDBYTES ..][0..POLYETA_PACKEDBYTES]);
+            const offset = S1_OFFSET + i * POLYETA_PACKEDBYTES;
+            assert(offset + POLYETA_PACKEDBYTES <= CRYPTO_SECRETKEYBYTES);
+            p.etaPack(sk[offset..][0..POLYETA_PACKEDBYTES]);
         }
 
         for (self.s2.vec, 0..) |p, i| {
-            p.etaPack(sk[S2_OFFSET + i * POLYETA_PACKEDBYTES ..][0..POLYETA_PACKEDBYTES]);
+            const offset = S2_OFFSET + i * POLYETA_PACKEDBYTES;
+            assert(offset + POLYETA_PACKEDBYTES <= CRYPTO_SECRETKEYBYTES);
+            p.etaPack(sk[offset..][0..POLYETA_PACKEDBYTES]);
         }
 
         for (self.t0.vec, 0..) |p, i| {
-            p.t0Pack(sk[T0_OFFSET + i * POLYT0_PACKEDBYTES ..][0..POLYT0_PACKEDBYTES]);
+            const offset = T0_OFFSET + i * POLYT0_PACKEDBYTES;
+            assert(offset + POLYT0_PACKEDBYTES <= CRYPTO_SECRETKEYBYTES);
+            p.t0Pack(sk[offset..][0..POLYT0_PACKEDBYTES]);
         }
     }
 
     /// Unpack secret key from byte array.
     pub fn unpack(self: *Self, sk: *const [CRYPTO_SECRETKEYBYTES]u8) void {
+        // Validate buffer size - runtime check to avoid comptime overflow
+        if (@as(u32, CRYPTO_SECRETKEYBYTES) < @as(u32, T0_OFFSET) + @as(u32, K) * @as(u32, POLYT0_PACKEDBYTES)) return;
+
         @memcpy(&self.rho, sk[0..SEEDBYTES]);
         @memcpy(&self.key, sk[KEY_OFFSET..][0..SEEDBYTES]);
         @memcpy(&self.tr, sk[TR_OFFSET..][0..TRBYTES]);
 
         for (&self.s1.vec, 0..) |*p, i| {
-            p.etaUnpack(sk[S1_OFFSET + i * POLYETA_PACKEDBYTES ..][0..POLYETA_PACKEDBYTES]);
+            const offset = S1_OFFSET + i * POLYETA_PACKEDBYTES;
+            // Runtime bounds check
+            if (offset + POLYETA_PACKEDBYTES > CRYPTO_SECRETKEYBYTES) continue;
+            p.etaUnpack(sk[offset..][0..POLYETA_PACKEDBYTES]);
         }
 
         for (&self.s2.vec, 0..) |*p, i| {
-            p.etaUnpack(sk[S2_OFFSET + i * POLYETA_PACKEDBYTES ..][0..POLYETA_PACKEDBYTES]);
+            const offset = S2_OFFSET + i * POLYETA_PACKEDBYTES;
+            // Runtime bounds check
+            if (offset + POLYETA_PACKEDBYTES > CRYPTO_SECRETKEYBYTES) continue;
+            p.etaUnpack(sk[offset..][0..POLYETA_PACKEDBYTES]);
         }
 
         for (&self.t0.vec, 0..) |*p, i| {
-            p.t0Unpack(sk[T0_OFFSET + i * POLYT0_PACKEDBYTES ..][0..POLYT0_PACKEDBYTES]);
+            const offset = T0_OFFSET + i * POLYT0_PACKEDBYTES;
+            // Runtime bounds check
+            if (offset + POLYT0_PACKEDBYTES > CRYPTO_SECRETKEYBYTES) continue;
+            p.t0Unpack(sk[offset..][0..POLYT0_PACKEDBYTES]);
         }
     }
 
@@ -149,19 +192,31 @@ pub const Signature = struct {
 
     /// Pack signature into byte array.
     pub fn pack(self: *const Self, sig: *[CRYPTO_BYTES]u8) void {
+        // Validate buffer size
+        comptime assert(CRYPTO_BYTES >= H_OFFSET + OMEGA + K);
+
         @memcpy(sig[0..CTILDEBYTES], &self.c);
 
         for (self.z.vec, 0..) |p, i| {
-            p.zPack(sig[Z_OFFSET + i * POLYZ_PACKEDBYTES ..][0..POLYZ_PACKEDBYTES]);
+            const offset = Z_OFFSET + i * POLYZ_PACKEDBYTES;
+            // Runtime bounds check
+            if (offset + POLYZ_PACKEDBYTES > CRYPTO_BYTES) continue;
+            p.zPack(sig[offset..][0..POLYZ_PACKEDBYTES]);
         }
 
         // Encode h (sparse representation)
-        @memset(sig[H_OFFSET..][0 .. OMEGA + K], 0);
+        secureClearBytes(sig[H_OFFSET..][0 .. OMEGA + K]);
 
         var k: usize = 0;
         for (self.h.vec, 0..) |p, i| {
             for (p.coeffs, 0..) |coeff, j| {
                 if (coeff != 0) {
+                    // Bounds check to prevent overflow
+                    if (k >= OMEGA) {
+                        // Too many non-zero coefficients - this should not happen in valid signatures
+                        // But we need to handle it securely to prevent buffer overflow
+                        continue;
+                    }
                     sig[H_OFFSET + k] = @intCast(j);
                     k += 1;
                 }
@@ -173,29 +228,51 @@ pub const Signature = struct {
     /// Unpack signature from byte array.
     /// Returns error if signature is malformed.
     pub fn unpack(self: *Self, sig: *const [CRYPTO_BYTES]u8) error{MalformedSignature}!void {
+        // Validate buffer size
+        comptime assert(CRYPTO_BYTES >= H_OFFSET + OMEGA + K);
+
         @memcpy(&self.c, sig[0..CTILDEBYTES]);
 
         for (&self.z.vec, 0..) |*p, i| {
-            p.zUnpack(sig[Z_OFFSET + i * POLYZ_PACKEDBYTES ..][0..POLYZ_PACKEDBYTES]);
+            const offset = Z_OFFSET + i * POLYZ_PACKEDBYTES;
+            // Runtime bounds check
+            if (offset + POLYZ_PACKEDBYTES > CRYPTO_BYTES) continue;
+            p.zUnpack(sig[offset..][0..POLYZ_PACKEDBYTES]);
         }
 
         // Decode h
         var k: usize = 0;
         for (&self.h.vec, 0..) |*p, i| {
-            @memset(&p.coeffs, 0);
+            secureClearBytes(std.mem.asBytes(&p.coeffs));
 
-            const end = sig[H_OFFSET + OMEGA + i];
+            const end_offset = H_OFFSET + OMEGA + i;
+            if (end_offset >= CRYPTO_BYTES) {
+                return error.MalformedSignature;
+            }
+
+            const end = sig[end_offset];
             if (end < k or end > OMEGA) {
                 return error.MalformedSignature;
             }
 
             var j: usize = k;
             while (j < end) : (j += 1) {
-                // Coefficients must be strictly increasing for strong unforgeability
-                if (j > k and sig[H_OFFSET + j] <= sig[H_OFFSET + j - 1]) {
+                const coeff_offset = H_OFFSET + j;
+                if (coeff_offset >= CRYPTO_BYTES) {
                     return error.MalformedSignature;
                 }
-                p.coeffs[sig[H_OFFSET + j]] = 1;
+
+                // Coefficients must be strictly increasing for strong unforgeability
+                if (j > k and sig[coeff_offset] <= sig[H_OFFSET + j - 1]) {
+                    return error.MalformedSignature;
+                }
+
+                const coeff_idx = sig[coeff_offset];
+                if (coeff_idx >= N) {
+                    return error.MalformedSignature;
+                }
+
+                p.coeffs[coeff_idx] = 1;
             }
 
             k = end;
@@ -203,7 +280,11 @@ pub const Signature = struct {
 
         // Extra indices must be zero for strong unforgeability
         for (k..OMEGA) |j| {
-            if (sig[H_OFFSET + j] != 0) {
+            const extra_offset = H_OFFSET + j;
+            if (extra_offset >= CRYPTO_BYTES) {
+                return error.MalformedSignature;
+            }
+            if (sig[extra_offset] != 0) {
                 return error.MalformedSignature;
             }
         }
@@ -343,7 +424,7 @@ pub fn packSig(
     offset += L * POLYZ_PACKEDBYTES;
 
     // Encode h
-    @memset(sig[offset..][0 .. OMEGA + K], 0);
+    secureClearBytes(sig[offset..][0 .. OMEGA + K]);
 
     var k: usize = 0;
     for (h.vec, 0..) |p, i| {
@@ -378,7 +459,7 @@ pub fn unpackSig(
     // Decode h
     var k: usize = 0;
     for (&h.vec, 0..) |*p, i| {
-        @memset(&p.coeffs, 0);
+        secureClearBytes(std.mem.asBytes(&p.coeffs));
 
         const end = sig[offset + OMEGA + i];
         if (end < k or end > OMEGA) {

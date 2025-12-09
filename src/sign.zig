@@ -2,6 +2,21 @@
 //! ML-DSA (FIPS 204) implementation.
 
 const std = @import("std");
+
+/// Securely clear memory to prevent compiler optimization
+/// Uses volatile pointer to ensure memory write is not optimized away
+fn secureClear(comptime T: type, ptr: *T) void {
+    const volatile_ptr: *volatile T = @ptrCast(ptr);
+    volatile_ptr.* = std.mem.zeroes(T);
+}
+
+/// Securely clear a byte array to prevent compiler optimization
+fn secureClearBytes(ptr: []u8) void {
+    const volatile_ptr: [*]volatile u8 = @ptrCast(ptr.ptr);
+    for (0..ptr.len) |i| {
+        volatile_ptr[i] = 0;
+    }
+}
 const params = @import("params.zig");
 const poly_mod = @import("poly.zig");
 const polyvec_mod = @import("polyvec.zig");
@@ -35,6 +50,7 @@ const Shake256 = std.crypto.hash.sha3.Shake256;
 
 pub const SigningError = error{
     ContextTooLong,
+    MessageTooLong,
     InvalidSignatureLength,
     InvalidSignature,
     VerificationFailed,
@@ -59,7 +75,7 @@ pub const KeyPair = struct {
     /// Generate a new key pair.
     pub fn generate(random: ?*const [SEEDBYTES]u8) Self {
         var seedbuf: [2 * SEEDBYTES + CRHBYTES]u8 = undefined;
-        defer @memset(&seedbuf, 0); // Zero sensitive seed material
+        defer secureClearBytes(&seedbuf); // Zero sensitive seed material
 
         // Get randomness for rho, rhoprime and key
         if (random) |r| {
@@ -151,6 +167,8 @@ pub fn sign(
     msg: []const u8,
     ctx: []const u8,
 ) SigningError![CRYPTO_BYTES]u8 {
+    // Validate inputs
+    if (msg.len > 1 << 30) return error.MessageTooLong;
     if (ctx.len > 255) return error.ContextTooLong;
 
     // Prepare prefix = (0, ctxlen, ctx)
@@ -189,9 +207,9 @@ fn signInternal(
     var t0 = sk.t0;
     defer {
         // Zero sensitive secret vectors after use
-        @memset(std.mem.asBytes(&s1), 0);
-        @memset(std.mem.asBytes(&s2), 0);
-        @memset(std.mem.asBytes(&t0), 0);
+        secureClearBytes(std.mem.asBytes(&s1));
+        secureClearBytes(std.mem.asBytes(&s2));
+        secureClearBytes(std.mem.asBytes(&t0));
     }
     s1.ntt();
     s2.ntt();
@@ -199,7 +217,7 @@ fn signInternal(
 
     // Compute mu = CRH(tr, pre, msg)
     var mu: [CRHBYTES]u8 = undefined;
-    defer @memset(&mu, 0); // Zero hash of secret tr
+    defer secureClearBytes(&mu); // Zero hash of secret tr
     {
         var hasher = Shake256.init(.{});
         hasher.update(&sk.tr);
@@ -210,7 +228,7 @@ fn signInternal(
 
     // Compute rhoprime = CRH(key, rnd, mu)
     var rhoprime: [CRHBYTES]u8 = undefined;
-    defer @memset(&rhoprime, 0); // Zero derived secret
+    defer secureClearBytes(&rhoprime); // Zero derived secret
     {
         var hasher = Shake256.init(.{});
         hasher.update(&sk.key);
@@ -300,7 +318,7 @@ fn signInternal(
 
 // --- Data Structures for Fast Convolution ---
 
-const SparsePolyIndices = struct { pos: [60]u16, pos_len: usize, neg: [60]u16, neg_len: usize };
+const SparsePolyIndices = struct { pos: [64]u16, pos_len: usize, neg: [64]u16, neg_len: usize };
 
 const ExtendedPoly = struct {
     data: [2 * N]i32,
@@ -370,7 +388,7 @@ fn signInternalOptimized(
 
     // Hashing setup
     var mu: [CRHBYTES]u8 = undefined;
-    defer @memset(&mu, 0);
+    defer secureClearBytes(&mu);
     {
         var hasher = Shake256.init(.{});
         hasher.update(&sk.tr);
@@ -380,7 +398,7 @@ fn signInternalOptimized(
     }
 
     var rhoprime: [CRHBYTES]u8 = undefined;
-    defer @memset(&rhoprime, 0);
+    defer secureClearBytes(&rhoprime);
     {
         var hasher = Shake256.init(.{});
         hasher.update(&sk.key);
@@ -486,13 +504,14 @@ inline fn parseSparseIndices(c: *const Poly, indices: *SparsePolyIndices) void {
     indices.pos_len = 0;
     indices.neg_len = 0;
     for (c.coeffs, 0..) |coeff, i| {
-        if (coeff == 1) {
-            indices.pos[indices.pos_len] = @intCast(i);
-            indices.pos_len += 1;
-        } else if (coeff == -1) {
-            indices.neg[indices.neg_len] = @intCast(i);
-            indices.neg_len += 1;
-        }
+        const is_pos = @intFromBool(coeff == 1);
+        const is_neg = @intFromBool(coeff == -1);
+
+        indices.pos[indices.pos_len] = @intCast(i);
+        indices.pos_len += is_pos;
+
+        indices.neg[indices.neg_len] = @intCast(i);
+        indices.neg_len += is_neg;
     }
 }
 
@@ -500,6 +519,7 @@ inline fn parseSparseIndices(c: *const Poly, indices: *SparsePolyIndices) void {
 /// Unrolled 4x (32 coefficients per iteration).
 fn pspmCheckNormDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
     var k: usize = 0;
+    var failed: u8 = 0;
     while (k < K) : (k += 1) {
         const s_data = &s_expanded.vec[k].data;
         const w0_coeffs = &w0.vec[k].coeffs;
@@ -507,43 +527,114 @@ fn pspmCheckNormDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const Ext
         // Iterate in chunks of 32 coefficients (4 SIMD registers)
         var i: usize = 0;
         while (i < N) : (i += 32) {
-            // Load w0 chunks
-            var acc0: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
-            var acc1: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
-            var acc2: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
-            var acc3: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+            // Bounds check before SIMD operations
+            if (i + 32 > N) break;
 
-            // Sparse Accumulation Loop
+            // Load w0 chunks with bounds checking
+            var acc0: simd.I32x8 = undefined;
+            var acc1: simd.I32x8 = undefined;
+            var acc2: simd.I32x8 = undefined;
+            var acc3: simd.I32x8 = undefined;
+
+            if (i + 8 <= N) {
+                acc0 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            } else {
+                // Fallback for partial chunk
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 0..@min(i + 8, N)) |j| {
+                    temp[j - (i + 0)] = w0_coeffs[j];
+                }
+                acc0 = simd.load(@ptrCast(&temp));
+            }
+
+            if (i + 16 <= N) {
+                acc1 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 8..@min(i + 16, N)) |j| {
+                    temp[j - (i + 8)] = w0_coeffs[j];
+                }
+                acc1 = simd.load(@ptrCast(&temp));
+            }
+
+            if (i + 24 <= N) {
+                acc2 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 16..@min(i + 24, N)) |j| {
+                    temp[j - (i + 16)] = w0_coeffs[j];
+                }
+                acc2 = simd.load(@ptrCast(&temp));
+            }
+
+            if (i + 32 <= N) {
+                acc3 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 24..@min(i + 32, N)) |j| {
+                    temp[j - (i + 24)] = w0_coeffs[j];
+                }
+                acc3 = simd.load(@ptrCast(&temp));
+            }
+
+            // Sparse Accumulation Loop with bounds checking
             for (c.pos[0..c.pos_len]) |p| {
                 const offset = N + i - p;
-                acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                // Bounds check for s_data access
+                if (offset + 32 > 2 * N) continue;
+
+                if (offset + 8 <= 2 * N) {
+                    acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                }
+                if (offset + 16 <= 2 * N) {
+                    acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                }
+                if (offset + 24 <= 2 * N) {
+                    acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                }
+                if (offset + 32 <= 2 * N) {
+                    acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                }
             }
 
             for (c.neg[0..c.neg_len]) |p| {
                 const offset = N + i - p;
-                acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                // Bounds check for s_data access
+                if (offset + 32 > 2 * N) continue;
+
+                if (offset + 8 <= 2 * N) {
+                    acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                }
+                if (offset + 16 <= 2 * N) {
+                    acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                }
+                if (offset + 24 <= 2 * N) {
+                    acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                }
+                if (offset + 32 <= 2 * N) {
+                    acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                }
             }
 
             // Check results
-            if (simd.anyGe(simd.abs(acc0), limit)) return false;
-            if (simd.anyGe(simd.abs(acc1), limit)) return false;
-            if (simd.anyGe(simd.abs(acc2), limit)) return false;
-            if (simd.anyGe(simd.abs(acc3), limit)) return false;
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc0), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
         }
     }
-    return true;
+    return failed == 0;
 }
 
 /// PSPM Check z.
 /// Unrolled 4x.
 fn pspmCheckNormSumUnrolled(c: *const SparsePolyIndices, s_expanded: *const ExtendedPolyVecL, y: *const PolyVecL, limit: i32, z_out: *PolyVecL) bool {
     var l: usize = 0;
+    var failed: u8 = 0;
     while (l < L) : (l += 1) {
         const s_data = &s_expanded.vec[l].data;
         const y_coeffs = &y.vec[l].coeffs;
@@ -551,40 +642,119 @@ fn pspmCheckNormSumUnrolled(c: *const SparsePolyIndices, s_expanded: *const Exte
 
         var i: usize = 0;
         while (i < N) : (i += 32) {
-            var acc0: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 0 ..].ptr));
-            var acc1: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 8 ..].ptr));
-            var acc2: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
-            var acc3: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
+            // Bounds check before SIMD operations
+            if (i + 32 > N) break;
 
-            // Sparse Accumulation Loop
+            // Load y chunks with bounds checking
+            var acc0: simd.I32x8 = undefined;
+            if (i + 8 <= N) {
+                acc0 = simd.load(@ptrCast(y_coeffs[i + 0 ..].ptr));
+            } else {
+                // Fallback for partial chunk
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 0..@min(i + 8, N)) |j| {
+                    temp[j - (i + 0)] = y_coeffs[j];
+                }
+                acc0 = simd.load(@ptrCast(&temp));
+            }
+
+            var acc1: simd.I32x8 = undefined;
+            if (i + 16 <= N) {
+                acc1 = simd.load(@ptrCast(y_coeffs[i + 8 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 8..@min(i + 16, N)) |j| {
+                    temp[j - (i + 8)] = y_coeffs[j];
+                }
+                acc1 = simd.load(@ptrCast(&temp));
+            }
+
+            var acc2: simd.I32x8 = undefined;
+            if (i + 24 <= N) {
+                acc2 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 16..@min(i + 24, N)) |j| {
+                    temp[j - (i + 16)] = y_coeffs[j];
+                }
+                acc2 = simd.load(@ptrCast(&temp));
+            }
+
+            var acc3: simd.I32x8 = undefined;
+            if (i + 32 <= N) {
+                acc3 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 24..@min(i + 32, N)) |j| {
+                    temp[j - (i + 24)] = y_coeffs[j];
+                }
+                acc3 = simd.load(@ptrCast(&temp));
+            }
+
+            // Sparse Accumulation Loop with bounds checking
             for (c.pos[0..c.pos_len]) |p| {
                 const offset = N + i - p;
-                acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                // Bounds check for s_data access
+                if (offset + 32 > 2 * N) continue;
+
+                if (offset + 8 <= 2 * N) {
+                    acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                }
+                if (offset + 16 <= 2 * N) {
+                    acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                }
+                if (offset + 24 <= 2 * N) {
+                    acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                }
+                if (offset + 32 <= 2 * N) {
+                    acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                }
             }
 
             for (c.neg[0..c.neg_len]) |p| {
                 const offset = N + i - p;
-                acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                // Bounds check for s_data access
+                if (offset + 32 > 2 * N) continue;
+
+                if (offset + 8 <= 2 * N) {
+                    acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                }
+                if (offset + 16 <= 2 * N) {
+                    acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                }
+                if (offset + 24 <= 2 * N) {
+                    acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                }
+                if (offset + 32 <= 2 * N) {
+                    acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                }
             }
 
-            if (simd.anyGe(simd.abs(acc0), limit)) return false;
-            if (simd.anyGe(simd.abs(acc1), limit)) return false;
-            if (simd.anyGe(simd.abs(acc2), limit)) return false;
-            if (simd.anyGe(simd.abs(acc3), limit)) return false;
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc0), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
+            failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
 
-            simd.store(@ptrCast(z_coeffs[i + 0 ..].ptr), acc0);
-            simd.store(@ptrCast(z_coeffs[i + 8 ..].ptr), acc1);
-            simd.store(@ptrCast(z_coeffs[i + 16 ..].ptr), acc2);
-            simd.store(@ptrCast(z_coeffs[i + 24 ..].ptr), acc3);
+            // Store results with bounds checking
+            if (i + 8 <= N) {
+                simd.store(@ptrCast(z_coeffs[i + 0 ..].ptr), acc0);
+            }
+            if (i + 16 <= N) {
+                simd.store(@ptrCast(z_coeffs[i + 8 ..].ptr), acc1);
+            }
+            if (i + 24 <= N) {
+                simd.store(@ptrCast(z_coeffs[i + 16 ..].ptr), acc2);
+            }
+            if (i + 32 <= N) {
+                simd.store(@ptrCast(z_coeffs[i + 24 ..].ptr), acc3);
+            }
         }
     }
-    return true;
+    return failed == 0;
 }
 
 fn pspmComputeDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, dest: *PolyVecK) void {
@@ -596,32 +766,111 @@ fn pspmComputeDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const Exten
 
         var i: usize = 0;
         while (i < N) : (i += 32) {
-            var acc0: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
-            var acc1: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
-            var acc2: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
-            var acc3: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+            // Bounds check before SIMD operations
+            if (i + 32 > N) break;
 
-            // Sparse Accumulation Loop
+            // Load w0 chunks with bounds checking
+            var acc0: simd.I32x8 = undefined;
+            if (i + 8 <= N) {
+                acc0 = simd.load(@ptrCast(w0_coeffs[i + 0 ..].ptr));
+            } else {
+                // Fallback for partial chunk
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 0..@min(i + 8, N)) |j| {
+                    temp[j - (i + 0)] = w0_coeffs[j];
+                }
+                acc0 = simd.load(@ptrCast(&temp));
+            }
+
+            var acc1: simd.I32x8 = undefined;
+            if (i + 16 <= N) {
+                acc1 = simd.load(@ptrCast(w0_coeffs[i + 8 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 8..@min(i + 16, N)) |j| {
+                    temp[j - (i + 8)] = w0_coeffs[j];
+                }
+                acc1 = simd.load(@ptrCast(&temp));
+            }
+
+            var acc2: simd.I32x8 = undefined;
+            if (i + 24 <= N) {
+                acc2 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 16..@min(i + 24, N)) |j| {
+                    temp[j - (i + 16)] = w0_coeffs[j];
+                }
+                acc2 = simd.load(@ptrCast(&temp));
+            }
+
+            var acc3: simd.I32x8 = undefined;
+            if (i + 32 <= N) {
+                acc3 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
+            } else {
+                var temp: [8]i32 = undefined;
+                @memset(&temp, 0);
+                for (i + 24..@min(i + 32, N)) |j| {
+                    temp[j - (i + 24)] = w0_coeffs[j];
+                }
+                acc3 = simd.load(@ptrCast(&temp));
+            }
+
+            // Sparse Accumulation Loop with bounds checking
             for (c.pos[0..c.pos_len]) |p| {
                 const offset = N + i - p;
-                acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                // Bounds check for s_data access
+                if (offset + 32 > 2 * N) continue;
+
+                if (offset + 8 <= 2 * N) {
+                    acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                }
+                if (offset + 16 <= 2 * N) {
+                    acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                }
+                if (offset + 24 <= 2 * N) {
+                    acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                }
+                if (offset + 32 <= 2 * N) {
+                    acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                }
             }
 
             for (c.neg[0..c.neg_len]) |p| {
                 const offset = N + i - p;
-                acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                // Bounds check for s_data access
+                if (offset + 32 > 2 * N) continue;
+
+                if (offset + 8 <= 2 * N) {
+                    acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                }
+                if (offset + 16 <= 2 * N) {
+                    acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                }
+                if (offset + 24 <= 2 * N) {
+                    acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                }
+                if (offset + 32 <= 2 * N) {
+                    acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+                }
             }
 
-            simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
-            simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
-            simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
-            simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
+            // Store results with bounds checking
+            if (i + 8 <= N) {
+                simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
+            }
+            if (i + 16 <= N) {
+                simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
+            }
+            if (i + 24 <= N) {
+                simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
+            }
+            if (i + 32 <= N) {
+                simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
+            }
         }
     }
 }
@@ -633,6 +882,8 @@ pub fn verify(
     ctx: []const u8,
     sig: *const [CRYPTO_BYTES]u8,
 ) SigningError!void {
+    // Validate inputs
+    if (msg.len > 1 << 30) return error.MessageTooLong;
     if (ctx.len > 255) return error.ContextTooLong;
 
     // Prepare prefix = (0, ctxlen, ctx)
@@ -644,27 +895,26 @@ pub fn verify(
     return verifyInternal(pk, msg, pre[0 .. 2 + ctx.len], sig);
 }
 
-/// Internal verification function.
+/// Internal verification function (constant-time).
 fn verifyInternal(
     pk: *const packing.PublicKey,
     msg: []const u8,
     pre: []const u8,
     sig: *const [CRYPTO_BYTES]u8,
 ) SigningError!void {
-    // Unpack signature
+    // Unpack signature - accumulate failure status instead of early return
     var c: [CTILDEBYTES]u8 = undefined;
     var z: PolyVecL = .{};
     var h: PolyVecK = .{};
 
-    if (!packing.unpackSig(&c, &z, &h, sig)) {
-        return error.InvalidSignature;
-    }
+    const unpack_ok = packing.unpackSig(&c, &z, &h, sig);
+    var valid = @intFromBool(unpack_ok);
 
-    if (!z.chknorm(GAMMA1 - BETA)) {
-        return error.InvalidSignature;
-    }
+    // Check z norm - accumulate failure instead of early return
+    const z_valid = z.chknorm(GAMMA1 - BETA);
+    valid &= @intFromBool(z_valid);
 
-    // Compute CRH(H(rho, t1), pre, msg)
+    // Compute CRH(H(rho, t1), pre, msg) - always compute regardless of previous failures
     var mu: [CRHBYTES]u8 = undefined;
     {
         const pk_bytes = pk.toBytes();
@@ -680,15 +930,15 @@ fn verifyInternal(
         hasher.squeeze(&mu);
     }
 
-    // Sample challenge polynomial
+    // Sample challenge polynomial - always sample
     var cp: Poly = .{};
     cp.challenge(&c);
 
-    // Expand matrix
+    // Expand matrix - always expand
     var mat: Mat = .{};
     mat.expand(&pk.rho);
 
-    // Compute Az - c*2^d*t1
+    // Compute Az - c*2^d*t1 - always compute full operation
     z.ntt();
 
     var w1: PolyVecK = .{};
@@ -705,15 +955,15 @@ fn verifyInternal(
     w1.reduce();
     w1.invnttTomont();
 
-    // Reconstruct w1
+    // Reconstruct w1 - always reconstruct
     w1.caddQ();
     PolyVecK.useHint(&w1, &w1, &h);
 
-    // In verifyInternal function:
+    // Pack w1 - always pack
     var w1_packed: [@as(usize, K) * POLYW1_PACKEDBYTES]u8 = undefined;
     w1.packW1(&w1_packed);
 
-    // Call random oracle and verify challenge
+    // Call random oracle and verify challenge - always compute
     var c2: [CTILDEBYTES]u8 = undefined;
     {
         var hasher = Shake256.init(.{});
@@ -722,7 +972,12 @@ fn verifyInternal(
         hasher.squeeze(&c2);
     }
 
-    if (!std.mem.eql(u8, &c, &c2)) {
+    // Final challenge comparison - accumulate result
+    const challenge_valid = std.mem.eql(u8, &c, &c2);
+    valid &= @intFromBool(challenge_valid);
+
+    // Return based on accumulated validity - single point of failure
+    if (valid == 0) {
         return error.VerificationFailed;
     }
 }
@@ -872,7 +1127,7 @@ pub fn cryptoSignOpen(
 
     verify(&public_key, sm[CRYPTO_BYTES..][0..msg_len], ctx[0..ctxlen], sm[0..CRYPTO_BYTES]) catch {
         mlen.* = 0;
-        @memset(m[0..smlen], 0);
+        secureClearBytes(m[0..smlen]);
         return -1;
     };
 

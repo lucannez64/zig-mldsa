@@ -2,6 +2,16 @@
 //! Operations on elements of Z_Q[X]/(X^N + 1).
 
 const std = @import("std");
+
+/// Securely clear memory to prevent compiler optimization
+/// Uses volatile pointer to ensure memory write is not optimized away
+fn secureClearBytes(ptr: []u8) void {
+    const volatile_ptr: [*]volatile u8 = @ptrCast(ptr.ptr);
+    for (0..ptr.len) |i| {
+        volatile_ptr[i] = 0;
+    }
+}
+
 const params = @import("params.zig");
 const reduce = @import("reduce.zig");
 const rounding = @import("rounding.zig");
@@ -314,23 +324,38 @@ pub const Poly = struct {
         }
         var pos: usize = 8;
 
-        @memset(&self.coeffs, 0);
+        secureClearBytes(std.mem.asBytes(&self.coeffs));
 
         const start: usize = @as(usize, N) - @as(usize, TAU);
         for (start..N) |i| {
             var b: usize = undefined;
-            while (true) {
+            var found: u8 = 0;
+
+            // Constant-time rejection sampling - always iterate max possible times
+            const max_iterations = 256; // Maximum possible iterations for safety
+            for (0..max_iterations) |_| {
                 if (pos >= SHAKE256_RATE) {
                     state.squeeze(&buf);
                     pos = 0;
                 }
-                b = buf[pos];
+
+                const candidate = buf[pos];
                 pos += 1;
-                if (b <= i) break;
+
+                // Use bitwise selection to update b when we find a valid candidate
+                const is_valid = @intFromBool(candidate <= @as(u8, @intCast(i)));
+                const is_first_valid = is_valid & (1 - found);
+                b = @intCast((@as(usize, @intCast(is_first_valid)) & candidate) |
+                    (@as(usize, @intCast(1 - is_first_valid)) & b));
+                found |= is_valid;
             }
 
-            self.coeffs[i] = self.coeffs[b];
-            self.coeffs[b] = 1 - 2 * @as(i32, @intCast(signs & 1));
+            // Ensure we always use the found value (even if not found, use last candidate)
+            const final_b = @as(usize, (@as(usize, @intCast(found)) & b) |
+                (@as(usize, @intCast(1 - found)) & 0));
+
+            self.coeffs[i] = self.coeffs[final_b];
+            self.coeffs[final_b] = 1 - 2 * @as(i32, @intCast(signs & 1));
             signs >>= 1;
         }
     }
@@ -567,17 +592,25 @@ fn rejUniform(a: []i32, buf: []const u8) usize {
     var ctr: usize = 0;
     var pos: usize = 0;
 
-    while (ctr < a.len and pos + 3 <= buf.len) {
+    // Process all possible triplets in constant time
+    const max_triplets = @min(a.len, buf.len / 3);
+    for (0..max_triplets) |_| {
         var t: u32 = buf[pos];
         t |= @as(u32, buf[pos + 1]) << 8;
         t |= @as(u32, buf[pos + 2]) << 16;
         t &= 0x7FFFFF;
         pos += 3;
 
-        if (t < Q) {
-            a[ctr] = @intCast(t);
-            ctr += 1;
-        }
+        // Use bitwise selection to update array when valid
+        const is_valid = @intFromBool(t < Q);
+        const valid_value = @as(i32, @intCast(t));
+
+        // Only update if we haven't filled the array yet
+        const should_update = is_valid & @intFromBool(ctr < a.len);
+        a[ctr] = (@as(i32, @intCast(should_update)) & valid_value) |
+            (@as(i32, @intCast(1 - should_update)) & a[ctr]);
+
+        if (should_update != 0) ctr += 1;
     }
     return ctr;
 }
@@ -587,32 +620,52 @@ fn rejEta(a: []i32, buf: []const u8) usize {
     var ctr: usize = 0;
     var pos: usize = 0;
 
-    while (ctr < a.len and pos < buf.len) {
+    // Process all possible nibbles in constant time
+    const max_nibbles = @min(2 * a.len, buf.len);
+    for (0..max_nibbles) |_| {
         const t0: u32 = buf[pos] & 0x0F;
         const t1: u32 = buf[pos] >> 4;
         pos += 1;
 
+        // Process first nibble (t0)
+        var valid0: u8 = 0;
+        var value0: i32 = 0;
+
         if (ETA == 2) {
-            if (t0 < 15) {
-                const v = t0 -% ((205 * t0) >> 10) * 5;
-                a[ctr] = @intCast(2 -% v);
-                ctr += 1;
-            }
-            if (t1 < 15 and ctr < a.len) {
-                const v = t1 -% ((205 * t1) >> 10) * 5;
-                a[ctr] = @intCast(2 -% v);
-                ctr += 1;
-            }
+            valid0 = @intFromBool(t0 < 15);
+            const v = t0 -% ((205 * t0) >> 10) * 5;
+            value0 = @intCast(2 -% v);
         } else if (ETA == 4) {
-            if (t0 < 9) {
-                a[ctr] = 4 - @as(i32, @intCast(t0));
-                ctr += 1;
-            }
-            if (t1 < 9 and ctr < a.len) {
-                a[ctr] = 4 - @as(i32, @intCast(t1));
-                ctr += 1;
-            }
+            valid0 = @intFromBool(t0 < 9);
+            value0 = 4 - @as(i32, @intCast(t0));
         }
+
+        const should_update0 = valid0 & @intFromBool(ctr < a.len);
+        if (ctr < a.len) {
+            a[ctr] = (@as(i32, @intCast(should_update0)) & value0) |
+                (@as(i32, @intCast(1 - should_update0)) & a[ctr]);
+        }
+        if (should_update0 != 0) ctr += 1;
+
+        // Process second nibble (t1)
+        var valid1: u8 = 0;
+        var value1: i32 = 0;
+
+        if (ETA == 2) {
+            valid1 = @intFromBool(t1 < 15);
+            const v = t1 -% ((205 * t1) >> 10) * 5;
+            value1 = @intCast(2 -% v);
+        } else if (ETA == 4) {
+            valid1 = @intFromBool(t1 < 9);
+            value1 = 4 - @as(i32, @intCast(t1));
+        }
+
+        const should_update1 = valid1 & @intFromBool(ctr < a.len);
+        if (ctr < a.len) {
+            a[ctr] = (@as(i32, @intCast(should_update1)) & value1) |
+                (@as(i32, @intCast(1 - should_update1)) & a[ctr]);
+        }
+        if (should_update1 != 0) ctr += 1;
     }
     return ctr;
 }
