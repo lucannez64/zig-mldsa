@@ -302,7 +302,7 @@ pub const Poly = struct {
 
     /// Sample polynomial with uniformly random coefficients in [-(GAMMA1-1), GAMMA1].
     pub fn uniformGamma1(self: *Self, seed: *const [CRHBYTES]u8, nonce: u16) void {
-        const NBLOCKS = (POLYZ_PACKEDBYTES + STREAM256_BLOCKBYTES - 1) / STREAM256_BLOCKBYTES;
+        const NBLOCKS = comptime (POLYZ_PACKEDBYTES + STREAM256_BLOCKBYTES - 1) / STREAM256_BLOCKBYTES;
 
         var buf: [NBLOCKS * STREAM256_BLOCKBYTES]u8 = undefined;
         var state = symmetric.Stream256State.init(seed, nonce);

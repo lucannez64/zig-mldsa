@@ -428,6 +428,9 @@ fn signInternalOptimized(
         hasher.squeeze(&mu);
     }
 
+    var c_tilde_hasher_state = Shake256.init(.{});
+    c_tilde_hasher_state.update(&mu);
+
     var rhoprime: [CRHBYTES]u8 = undefined;
     defer secureClearBytes(&rhoprime);
     {
@@ -450,7 +453,7 @@ fn signInternalOptimized(
     // Rejection sampling loop
     while (true) {
         // Sample intermediate vector y
-        var y: PolyVecL = .{};
+        var y: PolyVecL = undefined;
         y.uniformGamma1(&rhoprime, nonce);
         nonce += 1;
 
@@ -458,14 +461,14 @@ fn signInternalOptimized(
         var z = y;
         z.ntt();
 
-        var w1: PolyVecK = .{};
+        var w1: PolyVecK = undefined;
         Mat.pointwiseMontgomery(&w1, &mat, &z);
         w1.reduce();
         w1.invnttTomont();
 
         // Decompose w
         w1.caddQ();
-        var w0: PolyVecK = .{};
+        var w0: PolyVecK = undefined;
         PolyVecK.decompose(&w1, &w0, &w1);
 
         var w1_packed: [@as(usize, K) * POLYW1_PACKEDBYTES]u8 = undefined;
@@ -474,13 +477,12 @@ fn signInternalOptimized(
         // Challenge Generation
         var c_tilde: [CTILDEBYTES]u8 = undefined;
         {
-            var hasher = Shake256.init(.{});
-            hasher.update(&mu);
+            var hasher = c_tilde_hasher_state;
             hasher.update(&w1_packed);
             hasher.squeeze(&c_tilde);
         }
 
-        var cp: Poly = .{};
+        var cp: Poly = undefined;
         cp.challenge(&c_tilde);
 
         // Parse sparse coefficients
@@ -494,17 +496,6 @@ fn signInternalOptimized(
         // PSPM-TEE: Optimized Checks with Precomputed Offsets
         // ---------------------------------------------------------
 
-        // 2. CHECK r0 = LowBits(w - cs2)
-        var r0_valid: bool = undefined;
-        if (config.enable_software_pipelining) {
-            r0_valid = pspmCheckNormDiffPipelined(&c_offsets, &s2_expanded, &w0, GAMMA2 - BETA);
-        } else {
-            r0_valid = pspmCheckNormDiffOptimized(&c_offsets, &s2_expanded, &w0, GAMMA2 - BETA);
-        }
-        if (!r0_valid) {
-            continue;
-        }
-
         // 3. CHECK z = y + cs1
         var z_valid: bool = undefined;
         if (config.enable_software_pipelining) {
@@ -516,12 +507,24 @@ fn signInternalOptimized(
             continue;
         }
 
+        // 2. CHECK r0 = LowBits(w - cs2)
+        var r0_valid: bool = undefined;
+        var r_val_cache: PolyVecK = undefined;
+        if (config.enable_software_pipelining) {
+            r0_valid = pspmCheckNormDiffPipelined(&c_offsets, &s2_expanded, &w0, GAMMA2 - BETA, &r_val_cache);
+        } else {
+            r0_valid = pspmCheckNormDiffOptimized(&c_offsets, &s2_expanded, &w0, GAMMA2 - BETA, &r_val_cache);
+        }
+        if (!r0_valid) {
+            continue;
+        }
+
         // ---------------------------------------------------------
         // Final Hint Check
         // ---------------------------------------------------------
         cp.ntt();
 
-        var ct0: PolyVecK = .{};
+        var ct0: PolyVecK = undefined;
         ct0.pointwisePolyMontgomery(&cp, &t0_ntt);
         ct0.invnttTomont();
         ct0.reduce();
@@ -529,12 +532,7 @@ fn signInternalOptimized(
         if (!ct0.chknorm(GAMMA2)) continue;
 
         // Recompute rigorous r using optimized diff with precomputed offsets
-        var r_val: PolyVecK = undefined;
-        if (config.enable_software_pipelining) {
-            pspmComputeDiffPipelined(&c_offsets, &s2_expanded, &w0, &r_val);
-        } else {
-            pspmComputeDiffOptimized(&c_offsets, &s2_expanded, &w0, &r_val);
-        }
+        var r_val: PolyVecK = r_val_cache;
         r_val.add(&r_val, &ct0);
 
         const n = PolyVecK.makeHint(&h_final, &r_val, &w1);
@@ -569,12 +567,13 @@ inline fn parseSparseIndices(c: *const Poly, indices: *SparsePolyIndices) void {
 
 /// PSPM Check r0.
 /// Unrolled 4x (32 coefficients per iteration).
-fn pspmCheckNormDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
+fn pspmCheckNormDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32, dest: *PolyVecK) bool {
     var k: usize = 0;
     var failed: u8 = 0;
     while (k < K) : (k += 1) {
         const s_data = &s_expanded.vec[k].data;
         const w0_coeffs = &w0.vec[k].coeffs;
+        var d_coeffs = &dest.vec[k].coeffs;
 
         // Iterate in chunks of 32 coefficients (4 SIMD registers)
         var i: usize = 0;
@@ -677,6 +676,12 @@ fn pspmCheckNormDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const Ext
             failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
             failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
             failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
+
+            // Store results
+            simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
         }
     }
     return failed == 0;
@@ -789,12 +794,13 @@ fn pspmComputeDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const Exten
 
 /// PSPM Check r0 using precomputed offset table
 /// Eliminates runtime bounds checking in hot loops
-fn pspmCheckNormDiffOptimized(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
+fn pspmCheckNormDiffOptimized(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32, dest: *PolyVecK) bool {
     var k: usize = 0;
     var failed: u8 = 0;
     while (k < K) : (k += 1) {
         const s_data = &s_expanded.vec[k].data;
         const w0_coeffs = &w0.vec[k].coeffs;
+        var d_coeffs = &dest.vec[k].coeffs;
 
         // Iterate in chunks of 32 coefficients (4 SIMD registers)
         var i: usize = 0;
@@ -826,6 +832,12 @@ fn pspmCheckNormDiffOptimized(offsets: *const SparseOffsets, s_expanded: *const 
             failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
             failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
             failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
+
+            // Store results - no bounds checking needed since N is divisible by 32
+            simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
         }
     }
     return failed == 0;
@@ -833,8 +845,15 @@ fn pspmCheckNormDiffOptimized(offsets: *const SparseOffsets, s_expanded: *const 
 
 /// PSPM Check z using precomputed offset table
 fn pspmCheckNormSumOptimized(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecL, y: *const PolyVecL, limit: i32, z_out: *PolyVecL) bool {
-    var l: usize = 0;
+    const limit_vec = simd.broadcast(@as(i32, limit));
+    const sign_pos = simd.broadcast(@as(i32, 1));
+    const sign_neg = simd.broadcast(@as(i32, -1));
+
+    const offsets_slice = offsets.offsets[0..offsets.offsets_len];
+
     var failed: u8 = 0;
+    var l: usize = 0;
+
     while (l < L) : (l += 1) {
         const s_data = &s_expanded.vec[l].data;
         const y_coeffs = &y.vec[l].coeffs;
@@ -850,25 +869,24 @@ fn pspmCheckNormSumOptimized(offsets: *const SparseOffsets, s_expanded: *const E
             var acc1 = simd.load(@ptrCast(y_coeffs[i + 8 ..].ptr));
             var acc2 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
             var acc3 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
-
+            const max_valid_offset = 2 * N - 32 - i;
             // Optimized sparse accumulation using precomputed offsets
-            for (offsets.offsets[0..offsets.offsets_len]) |offset| {
-                const offset_idx = offset.offset + i; // base_offset + i = (N - position) + i = N + i - position
-                const sign_vec = simd.broadcast(offset.sign);
-
-                // Bounds check to ensure we don't access beyond s_data array
-                if (offset_idx + 32 <= 2 * N) {
-                    acc0 = acc0 + sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
-                    acc1 = acc1 + sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
-                    acc2 = acc2 + sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 16 ..].ptr));
-                    acc3 = acc3 + sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 24 ..].ptr));
+            for (offsets_slice) |offset| {
+                if (offset.offset > max_valid_offset) {
+                    break;
                 }
+                const offset_idx = offset.offset + i; // base_offset + i = (N - position) + i = N + i - position
+                const sign_vec = if (offset.sign == 1) sign_pos else sign_neg;
+                acc0 += sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 0 ..].ptr));
+                acc1 += sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 8 ..].ptr));
+                acc2 += sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 16 ..].ptr));
+                acc3 += sign_vec * simd.loadU(@ptrCast(s_data[offset_idx + 24 ..].ptr));
             }
 
-            failed |= @intFromBool(simd.anyGe(simd.abs(acc0), limit));
-            failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
-            failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
-            failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
+            failed |= @intFromBool(simd.anyGeVec(simd.abs(acc0), limit_vec));
+            failed |= @intFromBool(simd.anyGeVec(simd.abs(acc1), limit_vec));
+            failed |= @intFromBool(simd.anyGeVec(simd.abs(acc2), limit_vec));
+            failed |= @intFromBool(simd.anyGeVec(simd.abs(acc3), limit_vec));
 
             // Store results - no bounds checking needed since N is divisible by 32
             simd.store(@ptrCast(z_coeffs[i + 0 ..].ptr), acc0);
@@ -1189,12 +1207,13 @@ pub fn cryptoSignOpen(
 
 /// Software pipelined PSPM Check r0 - hides load latency through prefetching
 /// Uses double-buffering technique to overlap computation with memory access
-fn pspmCheckNormDiffPipelined(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
+fn pspmCheckNormDiffPipelined(offsets: *const SparseOffsets, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32, dest: *PolyVecK) bool {
     var k: usize = 0;
     var failed: u8 = 0;
     while (k < K) : (k += 1) {
         const s_data = &s_expanded.vec[k].data;
         const w0_coeffs = &w0.vec[k].coeffs;
+        var d_coeffs = &dest.vec[k].coeffs;
 
         // Iterate in chunks of 32 coefficients (4 SIMD registers)
         var i: usize = 0;
@@ -1262,6 +1281,12 @@ fn pspmCheckNormDiffPipelined(offsets: *const SparseOffsets, s_expanded: *const 
             failed |= @intFromBool(simd.anyGe(simd.abs(acc1), limit));
             failed |= @intFromBool(simd.anyGe(simd.abs(acc2), limit));
             failed |= @intFromBool(simd.anyGe(simd.abs(acc3), limit));
+
+            // Store results
+            simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
+            simd.store(@ptrCast(d_coeffs[i + 8 ..].ptr), acc1);
+            simd.store(@ptrCast(d_coeffs[i + 16 ..].ptr), acc2);
+            simd.store(@ptrCast(d_coeffs[i + 24 ..].ptr), acc3);
         }
     }
     return failed == 0;

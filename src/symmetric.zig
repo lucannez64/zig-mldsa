@@ -112,6 +112,127 @@ pub fn dilithium_shake256_stream_init(seed: *const [CRHBYTES]u8, nonce: u16) Str
 
 const keccak4x = @import("keccak4x.zig");
 
+/// Parallel SHAKE256 state for 4 streams.
+/// Parallel SHAKE256 state for 4 streams.
+pub const Stream256x4State = struct {
+    state: keccak4x.State4x,
+    offset: usize = 0, // Byte offset in the current block (same for all lanes)
+
+    const Self = @This();
+
+    /// Initialize 4 SHAKE256 states with same seed but distinct nonces.
+    pub fn init(seed: *const [SEEDBYTES]u8, nonces: [4]u16) Self {
+        var self = Self{
+            .state = undefined,
+        };
+
+        // Clear state to zero
+        secureClearBytes(std.mem.asBytes(&self.state.s));
+
+        // Load seed into first 4 u64 words (32 bytes)
+        const seed_u64 = std.mem.bytesAsSlice(u64, seed);
+        for (0..4) |i| {
+            self.state.s[i] = @splat(seed_u64[i]);
+        }
+
+        // Load nonces with domain separation (0x1F at bytes 2-3)
+        var word4: keccak4x.U64x4 = undefined;
+        var nonces_arr: [4]u64 = undefined;
+
+        for (0..4) |i| {
+            // Pack: nonce (16-bit) | 0x1F (8-bit) << 16
+            const val: u64 = @as(u64, nonces[i]) | (@as(u64, 0x1F) << 16);
+            nonces_arr[i] = val;
+        }
+        word4 = nonces_arr;
+
+        self.state.s[4] = word4;
+
+        // Add final padding bit (0x80) at the end of the rate
+        // SHAKE256 rate is 136 bytes = 17 u64 words
+        // Byte 135 is the MSB of word 16
+        const pad_final: u64 = @as(u64, 0x80) << 56;
+        self.state.s[16] ^= @as(keccak4x.U64x4, @splat(pad_final));
+
+        // Apply Keccak permutation
+        keccak4x.keccakF1600_4x(&self.state);
+
+        self.offset = 0;
+        return self;
+    }
+
+    /// Squeeze 4 blocks of output into 4 buffers.
+    /// Each buffer must be at least SHAKE256_RATE bytes.
+    pub fn squeezeBlocks(self: *Self, out0: []u8, out1: []u8, out2: []u8, out3: []u8) void {
+        std.debug.assert(out0.len >= SHAKE256_RATE);
+        std.debug.assert(out1.len >= SHAKE256_RATE);
+        std.debug.assert(out2.len >= SHAKE256_RATE);
+        std.debug.assert(out3.len >= SHAKE256_RATE);
+
+        const outs = [_][]u8{ out0, out1, out2, out3 };
+
+        // Extract 17 words (136 bytes) from state
+        for (0..17) |w_idx| {
+            const vec = self.state.s[w_idx];
+            const arr: [4]u64 = vec;
+            for (0..4) |lane| {
+                const bytes = std.mem.toBytes(arr[lane]); // Little-endian
+                @memcpy(outs[lane][w_idx * 8 .. (w_idx + 1) * 8], &bytes);
+            }
+        }
+
+        // Apply Keccak permutation for next block
+        keccak4x.keccakF1600_4x(&self.state);
+    }
+
+    /// Squeeze arbitrary length output into 4 buffers.
+    /// All output buffers must have the same length.
+    pub fn squeeze(self: *Self, out0: []u8, out1: []u8, out2: []u8, out3: []u8) void {
+        const out_len = out0.len;
+        std.debug.assert(out1.len == out_len);
+        std.debug.assert(out2.len == out_len);
+        std.debug.assert(out3.len == out_len);
+
+        var out_offset: usize = 0;
+        var temp_blocks = [_][SHAKE256_RATE]u8{
+            undefined, undefined, undefined, undefined,
+        };
+
+        // Squeeze full blocks
+        while (out_offset + SHAKE256_RATE <= out_len) {
+            self.squeezeBlocks(
+                temp_blocks[0][0..],
+                temp_blocks[1][0..],
+                temp_blocks[2][0..],
+                temp_blocks[3][0..],
+            );
+
+            @memcpy(out0[out_offset..][0..SHAKE256_RATE], &temp_blocks[0]);
+            @memcpy(out1[out_offset..][0..SHAKE256_RATE], &temp_blocks[1]);
+            @memcpy(out2[out_offset..][0..SHAKE256_RATE], &temp_blocks[2]);
+            @memcpy(out3[out_offset..][0..SHAKE256_RATE], &temp_blocks[3]);
+
+            out_offset += SHAKE256_RATE;
+        }
+
+        // Squeeze final partial block
+        const remaining = out_len - out_offset;
+        if (remaining > 0) {
+            self.squeezeBlocks(
+                temp_blocks[0][0..],
+                temp_blocks[1][0..],
+                temp_blocks[2][0..],
+                temp_blocks[3][0..],
+            );
+
+            @memcpy(out0[out_offset..][0..remaining], temp_blocks[0][0..remaining]);
+            @memcpy(out1[out_offset..][0..remaining], temp_blocks[1][0..remaining]);
+            @memcpy(out2[out_offset..][0..remaining], temp_blocks[2][0..remaining]);
+            @memcpy(out3[out_offset..][0..remaining], temp_blocks[3][0..remaining]);
+        }
+    }
+};
+
 /// Parallel SHAKE128 state for 4 streams.
 pub const Stream128x4State = struct {
     state: keccak4x.State4x,

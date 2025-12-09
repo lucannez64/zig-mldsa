@@ -125,6 +125,12 @@ pub inline fn anyGe(v: I32x8, scalar: i32) bool {
     return @reduce(.Or, pred);
 }
 
+pub inline fn anyGeVec(a: I32x8, b: I32x8) bool {
+   // Element-wise comparison produces boolean vector
+   // @reduce(.Or) performs horizontal OR across all lanes
+   return @reduce(.Or, a >= b);
+}
+
 test "simd broadcast and load" {
     const v = broadcast(42);
     const arr: [8]i32 = v;

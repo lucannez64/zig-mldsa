@@ -66,16 +66,18 @@ pub const PolyVecL = struct {
         const simd = @import("simd.zig");
         if (simd.has_simd) {
             const reduce_avx2 = @import("reduce_avx2.zig");
+            const I64x8 = @Vector(8, i64);
             var i: usize = 0;
             while (i < params.N) : (i += 8) {
-                var sum = simd.broadcast(0);
+                var sum: I64x8 = @splat(0);
                 inline for (0..L) |j| {
                     const va = simd.load(@ptrCast(&u.vec[j].coeffs[i]));
                     const vb = simd.load(@ptrCast(&v.vec[j].coeffs[i]));
-                    const prod = reduce_avx2.pointwiseMont8(va, vb);
+                    const prod = simd.mulWide(va, vb);
                     sum = sum + prod;
                 }
-                simd.store(@ptrCast(&w.coeffs[i]), sum);
+                const reduced_sum = reduce_avx2.montgomeryReduce8(sum);
+                simd.store(@ptrCast(&w.coeffs[i]), reduced_sum);
             }
         } else {
             w.pointwiseMontgomery(&u.vec[0], &v.vec[0]);
