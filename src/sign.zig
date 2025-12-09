@@ -300,6 +300,8 @@ fn signInternal(
 
 // --- Data Structures for Fast Convolution ---
 
+const SparsePolyIndices = struct { pos: [60]u16, pos_len: usize, neg: [60]u16, neg_len: usize };
+
 const ExtendedPoly = struct {
     data: [2 * N]i32,
 
@@ -394,6 +396,7 @@ fn signInternalOptimized(
     var z_final: PolyVecL = undefined;
     var h_final: PolyVecK = undefined;
     var c_tilde_final: [CTILDEBYTES]u8 = undefined;
+    var c_indices: SparsePolyIndices = undefined;
 
     // Rejection sampling loop
     while (true) {
@@ -432,21 +435,18 @@ fn signInternalOptimized(
         cp.challenge(&c_tilde);
 
         // Parse sparse coefficients
-        var c_idx: [60]u16 = undefined;
-        var c_sgn: [60]i8 = undefined;
-        const c_count = getSparseCoeffs(&cp, &c_idx, &c_sgn);
-
+        parseSparseIndices(&cp, &c_indices);
         // ---------------------------------------------------------
         // PSPM-TEE: Optimized Checks (Unrolled)
         // ---------------------------------------------------------
 
         // 2. CHECK r0 = LowBits(w - cs2)
-        if (!pspmCheckNormDiffUnrolled(&c_idx, &c_sgn, c_count, &s2_expanded, &w0, GAMMA2 - BETA)) {
+        if (!pspmCheckNormDiffUnrolled(&c_indices, &s2_expanded, &w0, GAMMA2 - BETA)) {
             continue;
         }
 
         // 3. CHECK z = y + cs1
-        if (!pspmCheckNormSumUnrolled(&c_idx, &c_sgn, c_count, &s1_expanded, &y, GAMMA1 - BETA, &z_final)) {
+        if (!pspmCheckNormSumUnrolled(&c_indices, &s1_expanded, &y, GAMMA1 - BETA, &z_final)) {
             continue;
         }
 
@@ -464,7 +464,7 @@ fn signInternalOptimized(
 
         // Recompute rigorous r using optimized diff
         var r_val: PolyVecK = undefined;
-        pspmComputeDiffUnrolled(&c_idx, &c_sgn, c_count, &s2_expanded, &w0, &r_val);
+        pspmComputeDiffUnrolled(&c_indices, &s2_expanded, &w0, &r_val);
         r_val.add(&r_val, &ct0);
 
         const n = PolyVecK.makeHint(&h_final, &r_val, &w1);
@@ -482,21 +482,23 @@ fn signInternalOptimized(
 // UNROLLED SIMD PSPM Functions
 // ------------------------------------------------------------------------
 
-fn getSparseCoeffs(c: *const Poly, indices: *[60]u16, signs: *[60]i8) usize {
-    var count: usize = 0;
+inline fn parseSparseIndices(c: *const Poly, indices: *SparsePolyIndices) void {
+    indices.pos_len = 0;
+    indices.neg_len = 0;
     for (c.coeffs, 0..) |coeff, i| {
-        if (coeff != 0) {
-            indices[count] = @intCast(i);
-            signs[count] = @intCast(coeff);
-            count += 1;
+        if (coeff == 1) {
+            indices.pos[indices.pos_len] = @intCast(i);
+            indices.pos_len += 1;
+        } else if (coeff == -1) {
+            indices.neg[indices.neg_len] = @intCast(i);
+            indices.neg_len += 1;
         }
     }
-    return count;
 }
 
 /// PSPM Check r0.
 /// Unrolled 4x (32 coefficients per iteration).
-fn pspmCheckNormDiffUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usize, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
+fn pspmCheckNormDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, limit: i32) bool {
     var k: usize = 0;
     while (k < K) : (k += 1) {
         const s_data = &s_expanded.vec[k].data;
@@ -512,30 +514,20 @@ fn pspmCheckNormDiffUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usi
             var acc3: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
 
             // Sparse Accumulation Loop
-            var j: usize = 0;
-            while (j < c_count) : (j += 1) {
-                const p = c_idx[j];
-                const sgn = c_sgn[j];
+            for (c.pos[0..c.pos_len]) |p| {
                 const offset = N + i - p;
+                acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+            }
 
-                // Load 4 contiguous vectors from extended s buffer
-                // This maximizes memory bandwidth utilization
-                const s0 = simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                const s1 = simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                const s2 = simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                const s3 = simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
-
-                if (sgn == 1) {
-                    acc0 = acc0 - s0;
-                    acc1 = acc1 - s1;
-                    acc2 = acc2 - s2;
-                    acc3 = acc3 - s3;
-                } else {
-                    acc0 = acc0 + s0;
-                    acc1 = acc1 + s1;
-                    acc2 = acc2 + s2;
-                    acc3 = acc3 + s3;
-                }
+            for (c.neg[0..c.neg_len]) |p| {
+                const offset = N + i - p;
+                acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
             }
 
             // Check results
@@ -550,7 +542,7 @@ fn pspmCheckNormDiffUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usi
 
 /// PSPM Check z.
 /// Unrolled 4x.
-fn pspmCheckNormSumUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usize, s_expanded: *const ExtendedPolyVecL, y: *const PolyVecL, limit: i32, z_out: *PolyVecL) bool {
+fn pspmCheckNormSumUnrolled(c: *const SparsePolyIndices, s_expanded: *const ExtendedPolyVecL, y: *const PolyVecL, limit: i32, z_out: *PolyVecL) bool {
     var l: usize = 0;
     while (l < L) : (l += 1) {
         const s_data = &s_expanded.vec[l].data;
@@ -564,28 +556,21 @@ fn pspmCheckNormSumUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usiz
             var acc2: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 16 ..].ptr));
             var acc3: simd.I32x8 = simd.load(@ptrCast(y_coeffs[i + 24 ..].ptr));
 
-            var j: usize = 0;
-            while (j < c_count) : (j += 1) {
-                const p = c_idx[j];
-                const sgn = c_sgn[j];
+            // Sparse Accumulation Loop
+            for (c.pos[0..c.pos_len]) |p| {
                 const offset = N + i - p;
+                acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+            }
 
-                const s0 = simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                const s1 = simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                const s2 = simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                const s3 = simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
-
-                if (sgn == 1) {
-                    acc0 = acc0 + s0;
-                    acc1 = acc1 + s1;
-                    acc2 = acc2 + s2;
-                    acc3 = acc3 + s3;
-                } else {
-                    acc0 = acc0 - s0;
-                    acc1 = acc1 - s1;
-                    acc2 = acc2 - s2;
-                    acc3 = acc3 - s3;
-                }
+            for (c.neg[0..c.neg_len]) |p| {
+                const offset = N + i - p;
+                acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
             }
 
             if (simd.anyGe(simd.abs(acc0), limit)) return false;
@@ -602,7 +587,7 @@ fn pspmCheckNormSumUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usiz
     return true;
 }
 
-fn pspmComputeDiffUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usize, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, dest: *PolyVecK) void {
+fn pspmComputeDiffUnrolled(c: *const SparsePolyIndices, s_expanded: *const ExtendedPolyVecK, w0: *const PolyVecK, dest: *PolyVecK) void {
     var k: usize = 0;
     while (k < K) : (k += 1) {
         const s_data = &s_expanded.vec[k].data;
@@ -616,28 +601,21 @@ fn pspmComputeDiffUnrolled(c_idx: []const u16, c_sgn: []const i8, c_count: usize
             var acc2: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 16 ..].ptr));
             var acc3: simd.I32x8 = simd.load(@ptrCast(w0_coeffs[i + 24 ..].ptr));
 
-            var j: usize = 0;
-            while (j < c_count) : (j += 1) {
-                const p = c_idx[j];
-                const sgn = c_sgn[j];
+            // Sparse Accumulation Loop
+            for (c.pos[0..c.pos_len]) |p| {
                 const offset = N + i - p;
+                acc0 = acc0 - simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 - simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 - simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 - simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
+            }
 
-                const s0 = simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
-                const s1 = simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
-                const s2 = simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
-                const s3 = simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
-
-                if (sgn == 1) {
-                    acc0 = acc0 - s0;
-                    acc1 = acc1 - s1;
-                    acc2 = acc2 - s2;
-                    acc3 = acc3 - s3;
-                } else {
-                    acc0 = acc0 + s0;
-                    acc1 = acc1 + s1;
-                    acc2 = acc2 + s2;
-                    acc3 = acc3 + s3;
-                }
+            for (c.neg[0..c.neg_len]) |p| {
+                const offset = N + i - p;
+                acc0 = acc0 + simd.loadU(@ptrCast(s_data[offset + 0 ..].ptr));
+                acc1 = acc1 + simd.loadU(@ptrCast(s_data[offset + 8 ..].ptr));
+                acc2 = acc2 + simd.loadU(@ptrCast(s_data[offset + 16 ..].ptr));
+                acc3 = acc3 + simd.loadU(@ptrCast(s_data[offset + 24 ..].ptr));
             }
 
             simd.store(@ptrCast(d_coeffs[i + 0 ..].ptr), acc0);
