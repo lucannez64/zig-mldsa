@@ -54,6 +54,32 @@ pub inline fn pointwiseMont8(a: I32x8, b: I32x8) I32x8 {
     return montgomeryReduce8(product);
 }
 
+/// Lazy pointwise multiplication.
+/// Performs a * b (low 32 bits) without reduction.
+/// Assumes result fits in i32 (which is true for Kyber coefficients * zeta).
+pub inline fn pointwiseLazyMul(a: I32x8, b: I32x8) I32x8 {
+    return simd.mulLo(a, b);
+}
+
+/// Lazy reduction.
+/// Reduces only when coefficients exceed a threshold to prevent overflow.
+/// Uses Montgomery reduction when reducing.
+pub inline fn lazyReduce(x: I32x8) I32x8 {
+    // Threshold to prevent overflow in subsequent additions.
+    // Lower threshold to 100M to be safe.
+    const threshold: I32x8 = @splat(100_000_000);
+    const neg_threshold: I32x8 = @splat(-100_000_000);
+
+    // Check if any lane exceeds bounds
+    const mask = (x > threshold) | (x < neg_threshold);
+
+    // If mask is all zeros, we can return x (fast path).
+    // But for vector selection, we compute reduced version.
+    const reduced = montgomeryReduce8(simd.widen(x));
+
+    return @select(i32, mask, reduced, x);
+}
+
 test "reduce_avx2 montgomery" {
     const reduce_scalar = @import("reduce.zig");
 

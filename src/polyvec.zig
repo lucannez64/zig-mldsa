@@ -63,30 +63,12 @@ pub const PolyVecL = struct {
     /// Pointwise multiply vectors and accumulate with Montgomery reduction.
     /// w = sum(u[i] * v[i]) * 2^{-32}
     pub fn pointwiseAccMontgomery(w: *Poly, u: *const Self, v: *const Self) void {
-        const simd = @import("simd.zig");
-        if (simd.has_simd) {
-            const reduce_avx2 = @import("reduce_avx2.zig");
-            const I64x8 = @Vector(8, i64);
-            var i: usize = 0;
-            while (i < params.N) : (i += 8) {
-                var sum: I64x8 = @splat(0);
-                inline for (0..L) |j| {
-                    const va = simd.load(@ptrCast(&u.vec[j].coeffs[i]));
-                    const vb = simd.load(@ptrCast(&v.vec[j].coeffs[i]));
-                    const prod = simd.mulWide(va, vb);
-                    sum = sum + prod;
-                }
-                const reduced_sum = reduce_avx2.montgomeryReduce8(sum);
-                simd.store(@ptrCast(&w.coeffs[i]), reduced_sum);
-            }
-        } else {
-            w.pointwiseMontgomery(&u.vec[0], &v.vec[0]);
+        w.pointwiseMontgomery(&u.vec[0], &v.vec[0]);
 
-            var t: Poly = .{};
-            for (1..L) |i| {
-                t.pointwiseMontgomery(&u.vec[i], &v.vec[i]);
-                w.add(w, &t);
-            }
+        var t: Poly = .{};
+        for (1..L) |i| {
+            t.pointwiseMontgomery(&u.vec[i], &v.vec[i]);
+            w.add(w, &t);
         }
     }
 
@@ -234,33 +216,30 @@ pub const Mat = struct {
     /// Expand matrix A from seed rho using SHAKE128.
     /// Generates uniformly random coefficients via rejection sampling.
     pub fn expand(self: *Self, rho: *const [SEEDBYTES]u8) void {
-        const total = K * L;
         var idx: usize = 0;
+        const total = K * L;
 
-        // Process 4 polynomials at a time using parallel SHAKE
+        // Process 4 polynomials at a time with parallel SHAKE instances
         while (idx + 4 <= total) : (idx += 4) {
-            const idx0 = idx / L;
-            const j0 = idx % L;
-            const idx1 = (idx + 1) / L;
-            const j1 = (idx + 1) % L;
-            const idx2 = (idx + 2) / L;
-            const j2 = (idx + 2) % L;
-            const idx3 = (idx + 3) / L;
-            const j3 = (idx + 3) % L;
+            var nonces: [4]u16 = undefined;
+            var polys: [4]*Poly = undefined;
 
-            const nonce0: u16 = (@as(u16, @intCast(idx0)) << 8) + @as(u16, @intCast(j0));
-            const nonce1: u16 = (@as(u16, @intCast(idx1)) << 8) + @as(u16, @intCast(j1));
-            const nonce2: u16 = (@as(u16, @intCast(idx2)) << 8) + @as(u16, @intCast(j2));
-            const nonce3: u16 = (@as(u16, @intCast(idx3)) << 8) + @as(u16, @intCast(j3));
+            for (0..4) |k| {
+                const flat_idx = idx + k;
+                const i = flat_idx / L;
+                const j = flat_idx % L;
+                nonces[k] = (@as(u16, @intCast(i)) << 8) | @as(u16, @intCast(j));
+                polys[k] = &self.rows[i].vec[j];
+            }
 
-            Poly.uniform_4x(&self.rows[idx0].vec[j0], &self.rows[idx1].vec[j1], &self.rows[idx2].vec[j2], &self.rows[idx3].vec[j3], rho, .{ nonce0, nonce1, nonce2, nonce3 });
+            uniformX4(polys, rho, nonces);
         }
 
-        // Handle remaining polynomials
+        // Handle remaining polynomials (0-3)
         while (idx < total) : (idx += 1) {
             const i = idx / L;
             const j = idx % L;
-            const nonce: u16 = (@as(u16, @intCast(i)) << 8) + @as(u16, @intCast(j));
+            const nonce: u16 = (@as(u16, @intCast(i)) << 8) | @as(u16, @intCast(j));
             self.rows[i].vec[j].uniform(rho, nonce);
         }
     }
@@ -273,6 +252,149 @@ pub const Mat = struct {
         }
     }
 };
+
+/// Process 4 polynomials in parallel using interleaved SHAKE128 states.
+fn uniformX4(
+    polys: [4]*Poly,
+    rho: *const [SEEDBYTES]u8,
+    nonces: [4]u16,
+) void {
+    // Initialize 4 SHAKE128 states
+    var states: [4]std.crypto.hash.sha3.Shake128 = undefined;
+    for (0..4) |k| {
+        states[k] = std.crypto.hash.sha3.Shake128.init(.{});
+        states[k].update(rho);
+        states[k].update(std.mem.asBytes(&nonces[k]));
+    }
+
+    // Larger buffer reduces squeeze overhead - 840 bytes = 280 coefficients worth
+    const BUFLEN = 840;
+    var bufs: [4][BUFLEN]u8 = undefined;
+    var positions: [4]usize = .{ BUFLEN, BUFLEN, BUFLEN, BUFLEN };
+    var coeff_counts: [4]usize = .{ 0, 0, 0, 0 };
+
+    // Track which polynomials are done
+    var done: u4 = 0;
+
+    while (done != 0xF) {
+        // Squeeze new bytes for states that need them
+        for (0..4) |k| {
+            if ((done >> @intCast(k)) & 1 == 0 and positions[k] >= BUFLEN - 2) {
+                states[k].squeeze(&bufs[k]);
+                positions[k] = 0;
+            }
+        }
+
+        // Process bytes in batches using SIMD extraction
+        for (0..4) |k| {
+            if ((done >> @intCast(k)) & 1 == 1) continue;
+
+            const remaining_coeffs = params.N - coeff_counts[k];
+            const remaining_bytes = BUFLEN - positions[k];
+            // Each coefficient needs 3 bytes
+            const batch_size = @min(remaining_bytes / 3, remaining_coeffs);
+
+            const accepted = extractCoeffsBatch(
+                bufs[k][positions[k]..],
+                polys[k].coeffs[coeff_counts[k]..],
+                batch_size,
+            );
+
+            coeff_counts[k] += accepted;
+            positions[k] += batch_size * 3;
+
+            if (coeff_counts[k] >= params.N) {
+                done |= @as(u4, 1) << @intCast(k);
+            }
+        }
+    }
+}
+
+/// Extract coefficients using optimized SIMD operations.
+/// Returns number of accepted coefficients.
+fn extractCoeffsBatch(
+    src: []const u8,
+    dst: []i32,
+    max_candidates: usize,
+) usize {
+    const Q: u32 = 8380417;
+    var accepted: usize = 0;
+    var i: usize = 0;
+
+    // Process 8 candidates at a time with SIMD
+    while (i + 8 <= max_candidates and accepted + 8 <= dst.len) {
+        const coeffs = extractEightCoeffs(src[i * 3 ..]);
+        const mask = simdReject(coeffs, Q);
+
+        // Use SIMD compress to pack accepted values
+        accepted += simdCompress(coeffs, mask, dst[accepted..]);
+        i += 8;
+    }
+
+    // Scalar fallback for remainder
+    while (i < max_candidates and accepted < dst.len) {
+        const b0: u32 = src[i * 3 + 0];
+        const b1: u32 = src[i * 3 + 1];
+        const b2: u32 = src[i * 3 + 2];
+
+        const coeff = b0 | (b1 << 8) | ((b2 & 0x7F) << 16);
+
+        // Constant-time conditional store
+        const accept = @intFromBool(coeff < Q);
+        dst[accepted] = @intCast(coeff);
+        accepted += accept;
+        i += 1;
+    }
+
+    return accepted;
+}
+
+/// Extract 8 23-bit coefficients using SIMD.
+inline fn extractEightCoeffs(src: []const u8) @Vector(8, u32) {
+    // Load 24 bytes (8 * 3) and extract 23-bit values
+    // Use gather pattern optimized for the 3-byte stride
+
+    var result: @Vector(8, u32) = @splat(0);
+
+    // Unrolled extraction - compiler will optimize memory access patterns
+    comptime var j: usize = 0;
+    inline while (j < 8) : (j += 1) {
+        const base = j * 3;
+        const b0: u32 = src[base + 0];
+        const b1: u32 = src[base + 1];
+        const b2: u32 = src[base + 2] & 0x7F;
+        result[j] = b0 | (b1 << 8) | (b2 << 16);
+    }
+
+    return result;
+}
+
+/// SIMD comparison returning mask of values < Q.
+inline fn simdReject(coeffs: @Vector(8, u32), q: u32) @Vector(8, bool) {
+    const q_vec: @Vector(8, u32) = @splat(q);
+    return coeffs < q_vec;
+}
+
+/// Compress accepted values and return count.
+inline fn simdCompress(
+    coeffs: @Vector(8, u32),
+    mask: @Vector(8, bool),
+    dst: []i32,
+) usize {
+    var count: usize = 0;
+
+    // Branchless store using mask
+    comptime var j: usize = 0;
+    inline while (j < 8) : (j += 1) {
+        const accept = @intFromBool(mask[j]);
+        if (count < dst.len) {
+            dst[count] = @intCast(coeffs[j]);
+        }
+        count += accept;
+    }
+
+    return count;
+}
 
 // ==================== Tests ====================
 

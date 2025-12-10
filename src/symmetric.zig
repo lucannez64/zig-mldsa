@@ -242,12 +242,11 @@ pub const Stream128x4State = struct {
 
     /// Initialize 4 SHAKE128 states with same seed but distinct nonces.
     pub fn init(seed: *const [SEEDBYTES]u8, nonces: [4]u16) Self {
-        var self = Self{
-            .state = undefined,
-        };
-
-        // Clear state
-        secureClearBytes(std.mem.asBytes(&self.state.s));
+        var self: Self = undefined;
+        // Zero the state
+        for (0..25) |i| {
+            self.state.s[i] = @splat(0);
+        }
 
         // Prepare input block: seed || nonce (little-endian)
         // Length = 32 + 2 = 34 bytes.

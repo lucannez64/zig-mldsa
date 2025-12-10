@@ -150,6 +150,41 @@ pub const KeyPair = struct {
         };
     }
 
+    pub fn fromSecretKey(sk: packing.SecretKey) Self {
+        const rho = &sk.rho;
+
+        // Expand matrix
+        var mat: Mat = .{};
+        mat.expand(rho);
+
+        // Matrix-vector multiplication
+        var s1hat = sk.s1;
+        s1hat.ntt();
+
+        var t1: PolyVecK = .{};
+        Mat.pointwiseMontgomery(&t1, &mat, &s1hat);
+        t1.reduce();
+        t1.invnttTomont();
+
+        // Add error vector s2
+        t1.add(&t1, &sk.s2);
+
+        // Extract t1 and t0
+        t1.caddQ();
+        var t0: PolyVecK = .{};
+        PolyVecK.power2Round(&t1, &t0, &t1);
+
+        // Build public key
+        var pk = packing.PublicKey{};
+        @memcpy(&pk.rho, rho);
+        pk.t1 = t1;
+
+        return .{
+            .public_key = pk,
+            .secret_key = sk,
+        };
+    }
+
     /// Generate from packed bytes.
     pub fn fromBytes(
         pk_bytes: *const [CRYPTO_PUBLICKEYBYTES]u8,
@@ -167,6 +202,7 @@ pub fn sign(
     sk: *const packing.SecretKey,
     msg: []const u8,
     ctx: []const u8,
+    random: ?*const [RNDBYTES]u8,
 ) SigningError![CRYPTO_BYTES]u8 {
     // Validate inputs
     if (msg.len > 1 << 30) return error.MessageTooLong;
@@ -180,7 +216,9 @@ pub fn sign(
 
     // Get randomness
     var rnd: [RNDBYTES]u8 = undefined;
-    if (signing_mode == .randomized) {
+    if (random) |r| {
+        @memcpy(&rnd, r);
+    } else if (signing_mode == .randomized) {
         std.crypto.random.bytes(&rnd);
     } else {
         @memset(&rnd, 0);
@@ -1065,7 +1103,7 @@ pub fn signMessage(
     }
 
     // Sign
-    const sig = try sign(sk, out[CRYPTO_BYTES..][0..msg.len], ctx);
+    const sig = try sign(sk, out[CRYPTO_BYTES..][0..msg.len], ctx, null);
     @memcpy(out[0..CRYPTO_BYTES], &sig);
 
     return CRYPTO_BYTES + msg.len;
@@ -1116,7 +1154,7 @@ pub fn cryptoSignSignature(
     if (ctxlen > 255) return -1;
 
     const secret_key = packing.SecretKey.fromBytes(sk);
-    const result = sign(&secret_key, m[0..mlen], ctx[0..ctxlen]) catch return -1;
+    const result = sign(&secret_key, m[0..mlen], ctx[0..ctxlen], null) catch return -1;
 
     @memcpy(sig, &result);
     siglen.* = CRYPTO_BYTES;
@@ -1162,7 +1200,7 @@ pub fn cryptoSign(
         sm[CRYPTO_BYTES + i] = m[i];
     }
 
-    const sig = sign(&secret_key, sm[CRYPTO_BYTES..][0..mlen], ctx[0..ctxlen]) catch return -1;
+    const sig = sign(&secret_key, sm[CRYPTO_BYTES..][0..mlen], ctx[0..ctxlen], null) catch return -1;
     @memcpy(sm[0..CRYPTO_BYTES], &sig);
     smlen.* = CRYPTO_BYTES + mlen;
     return 0;
@@ -1470,7 +1508,7 @@ test "sign and verify" {
     const msg = "test message";
     const ctx = "context";
 
-    const sig = try sign(&kp.secret_key, msg, ctx);
+    const sig = try sign(&kp.secret_key, msg, ctx, null);
     try verify(&kp.public_key, msg, ctx, &sig);
 }
 
@@ -1480,7 +1518,7 @@ test "sign and verify empty context" {
 
     const msg = "test message";
 
-    const sig = try sign(&kp.secret_key, msg, "");
+    const sig = try sign(&kp.secret_key, msg, "", null);
     try verify(&kp.public_key, msg, "", &sig);
 }
 
@@ -1491,7 +1529,7 @@ test "verify fails with wrong message" {
     const msg = "test message";
     const ctx = "";
 
-    const sig = try sign(&kp.secret_key, msg, ctx);
+    const sig = try sign(&kp.secret_key, msg, ctx, null);
 
     const result = verify(&kp.public_key, "wrong message", ctx, &sig);
     try std.testing.expectError(error.VerificationFailed, result);
@@ -1503,7 +1541,7 @@ test "verify fails with wrong context" {
 
     const msg = "test message";
 
-    const sig = try sign(&kp.secret_key, msg, "ctx1");
+    const sig = try sign(&kp.secret_key, msg, "ctx1", null);
 
     const result = verify(&kp.public_key, msg, "ctx2", &sig);
     try std.testing.expectError(error.VerificationFailed, result);
@@ -1516,7 +1554,7 @@ test "context too long" {
     const msg = "test message";
     const long_ctx = [_]u8{0} ** 256;
 
-    const result = sign(&kp.secret_key, msg, &long_ctx);
+    const result = sign(&kp.secret_key, msg, &long_ctx, null);
     try std.testing.expectError(error.ContextTooLong, result);
 }
 
