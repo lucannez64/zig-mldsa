@@ -174,11 +174,12 @@ fn MlDsa(comptime p: Params) type {
                 self: SecretKey,
                 msg: []const u8,
                 ctx: []const u8,
+                random: ?*const [32]u8,
             ) SigningError![signature_length]u8 {
                 // Validate inputs
                 if (msg.len > 1 << 30) return error.MessageTooLong;
                 if (ctx.len > 255) return error.ContextTooLong;
-                return sign_mod.sign(&self.sk, msg, ctx);
+                return sign_mod.sign(&self.sk, msg, ctx, random);
             }
 
             /// Serializes the secret key to bytes.
@@ -207,6 +208,17 @@ fn MlDsa(comptime p: Params) type {
                 return .{
                     .public_key = .{ .pk = inner_kp.public_key },
                     .secret_key = .{ .sk = inner_kp.secret_key },
+                };
+            }
+            /// Creates a key pair from secretkey serialized bytes.
+            pub fn fromSkBytes(
+                sk_bytes: *const [secret_key_length]u8,
+            ) KeyPair {
+                const sk = SecretKey.fromBytes(sk_bytes);
+                const inner_kp = sign_mod.KeyPair.fromSecretKey(sk.sk);
+                return .{
+                    .public_key = .{ .pk = inner_kp.public_key },
+                    .secret_key = sk,
                 };
             }
 
@@ -240,7 +252,7 @@ fn MlDsa(comptime p: Params) type {
 
             /// Signs the complete message and returns the signature.
             pub fn finalize(self: Signer, msg: []const u8) SigningError![signature_length]u8 {
-                return self.secret_key.sign(msg, self.ctx);
+                return self.secret_key.sign(msg, self.ctx, null);
             }
         };
 
@@ -296,7 +308,7 @@ test "MlDsa65 sign and verify" {
     const msg = "Hello, post-quantum world!";
     const ctx = "test context";
 
-    const sig = try kp.secret_key.sign(msg, ctx);
+    const sig = try kp.secret_key.sign(msg, ctx, null);
     try kp.public_key.verify(msg, ctx, &sig);
 }
 
@@ -306,7 +318,7 @@ test "MlDsa65 sign and verify empty context" {
 
     const msg = "test message";
 
-    const sig = try kp.secret_key.sign(msg, "");
+    const sig = try kp.secret_key.sign(msg, "", null);
     try kp.public_key.verify(msg, "", &sig);
 }
 
@@ -315,7 +327,7 @@ test "MlDsa65 verify fails with wrong message" {
     const kp = MlDsa65.KeyPair.generate(&seed);
 
     const msg = "test message";
-    const sig = try kp.secret_key.sign(msg, "");
+    const sig = try kp.secret_key.sign(msg, "", null);
 
     const result = kp.public_key.verify("wrong message", "", &sig);
     try std.testing.expectError(error.VerificationFailed, result);
@@ -326,7 +338,7 @@ test "MlDsa65 verify fails with wrong context" {
     const kp = MlDsa65.KeyPair.generate(&seed);
 
     const msg = "test message";
-    const sig = try kp.secret_key.sign(msg, "ctx1");
+    const sig = try kp.secret_key.sign(msg, "ctx1", null);
 
     const result = kp.public_key.verify(msg, "ctx2", &sig);
     try std.testing.expectError(error.VerificationFailed, result);
@@ -339,7 +351,7 @@ test "MlDsa65 context too long" {
     const msg = "test message";
     const long_ctx = [_]u8{0} ** 256;
 
-    const result = kp.secret_key.sign(msg, &long_ctx);
+    const result = kp.secret_key.sign(msg, &long_ctx, null);
     try std.testing.expectError(error.ContextTooLong, result);
 }
 
@@ -405,7 +417,7 @@ test "FIPS 204 ML-DSA-65 deterministic key generation" {
 
     // Additional verification: key pair works for sign/verify
     const msg = "FIPS 204 KAT message";
-    const sig = try kp1.secret_key.sign(msg, "");
+    const sig = try kp1.secret_key.sign(msg, "", null);
     try kp2.public_key.verify(msg, "", &sig);
 }
 
@@ -420,7 +432,7 @@ test "FIPS 204 signature self-consistency" {
     const ctx = "";
 
     // Sign the message (deterministic signing with empty context)
-    const sig = try kp.secret_key.sign(msg, ctx);
+    const sig = try kp.secret_key.sign(msg, ctx, null);
 
     // Verify signature
     try kp.public_key.verify(msg, ctx, &sig);
@@ -437,7 +449,7 @@ test "edge case: empty message" {
     const kp = MlDsa65.KeyPair.generate(&seed);
 
     // Sign and verify an empty message
-    const sig = try kp.secret_key.sign("", "");
+    const sig = try kp.secret_key.sign("", "", null);
     try kp.public_key.verify("", "", &sig);
 
     // Wrong message should fail
@@ -453,7 +465,7 @@ test "edge case: maximum context length (255 bytes)" {
     const max_ctx = [_]u8{0xAB} ** 255;
     const msg = "test message with max context";
 
-    const sig = try kp.secret_key.sign(msg, &max_ctx);
+    const sig = try kp.secret_key.sign(msg, &max_ctx, null);
     try kp.public_key.verify(msg, &max_ctx, &sig);
 
     // Different context should fail
@@ -487,4 +499,8 @@ test "KAT: public key determinism check" {
 
     // Log the hash for manual verification during development
     // std.debug.print("PK hash prefix: {x}\n", .{hash_prefix.*});
+}
+
+test {
+    _ = @import("nist_kat.zig");
 }

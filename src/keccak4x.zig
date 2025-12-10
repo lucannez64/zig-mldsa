@@ -1,5 +1,6 @@
 const std = @import("std");
 const simd = @import("simd.zig");
+const builtin = @import("builtin");
 
 pub const U64x4 = @Vector(4, u64);
 
@@ -29,11 +30,14 @@ const rho_offsets = [_]u6{
 };
 
 inline fn rol(x: U64x4, comptime n: u6) U64x4 {
-    // Zig's vector shift handles rotation if we implement it right,
-    // but typically we do (x << n) | (x >> (64 - n))
     if (n == 0) return x;
-    const r = 64 - @as(u7, n);
-    return (x << @splat(n)) | (x >> @splat(@as(u6, @intCast(r))));
+    if (builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2)) {
+        // RORX is faster on some microarchitectures
+        // return @bitCast(std.simd.rotateElementsLeft(x, n));
+        // std.simd.rotateElementsLeft not available?
+    }
+    const shift: u64 = n;
+    return (x << @splat(shift)) | (x >> @splat(64 - shift));
 }
 
 pub fn keccakF1600_4x(state: *State4x) void {

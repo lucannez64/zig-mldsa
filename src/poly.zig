@@ -12,6 +12,7 @@ fn secureClearBytes(ptr: []u8) void {
     }
 }
 
+const simd = @import("simd.zig");
 const params = @import("params.zig");
 const reduce = @import("reduce.zig");
 const rounding = @import("rounding.zig");
@@ -108,7 +109,6 @@ pub const Poly = struct {
     /// self = a * b * 2^{-32}
     /// Uses AVX2 acceleration when available.
     pub fn pointwiseMontgomery(self: *Self, a: *const Self, b: *const Self) void {
-        const simd = @import("simd.zig");
         if (simd.has_simd) {
             const reduce_avx2 = @import("reduce_avx2.zig");
             var i: usize = 0;
@@ -148,7 +148,7 @@ pub const Poly = struct {
     }
 
     /// Compute hint polynomial. Returns number of 1 bits.
-    pub fn polyMakeHint(h: *Self, a0: *const Self, a1: *const Self) u32 {
+    pub fn polyMakeHintScalar(h: *Self, a0: *const Self, a1: *const Self) u32 {
         var s: u32 = 0;
         for (&h.coeffs, a0.coeffs, a1.coeffs) |*hc, c0, c1| {
             const hint = makeHint(c0, c1);
@@ -158,6 +158,56 @@ pub const Poly = struct {
         }
         return s;
     }
+    /// Compute hint polynomial. Returns number of 1 bits.
+    /// Compute hint polynomial (SIMD). Returns number of 1 bits.
+    pub fn polyMakeHint(h: *Poly, a0: *const Poly, a1: *const Poly) u32 {
+        if (!simd.has_simd) {
+            return polyMakeHintScalar(h, a0, a1);
+        }
+        const gamma2_pos: simd.I32x8 = @splat(GAMMA2);
+        const gamma2_neg: simd.I32x8 = @splat(-GAMMA2);
+        const zero: simd.I32x8 = @splat(0);
+        const one: simd.I32x8 = @splat(1);
+        const Vec8u = @Vector(8, u32);
+        var count: Vec8u = @splat(0);
+
+        const h_ptr: [*]i32 = &h.coeffs;
+        const a0_ptr: [*]const i32 = &a0.coeffs;
+        const a1_ptr: [*]const i32 = &a1.coeffs;
+
+        comptime var i: usize = 0;
+        inline while (i < N) : (i += 8) {
+            const c0: simd.I32x8 = a0_ptr[i..][0..8].*;
+            const c1: simd.I32x8 = a1_ptr[i..][0..8].*;
+
+            // c0 > GAMMA2
+            const gt_pos = c0 > gamma2_pos;
+
+            // c0 < -GAMMA2
+            const lt_neg = c0 < gamma2_neg;
+
+            // c0 == -GAMMA2 AND c1 != 0
+            const eq_neg = c0 == gamma2_neg;
+            const c1_nz = c1 != zero;
+            const edge_case = eq_neg & c1_nz;
+
+            // Combine conditions
+            const hint_mask = gt_pos | lt_neg | edge_case;
+
+            // Convert bool vector to 0/1 integers
+            const hint_vals = @select(i32, hint_mask, one, zero);
+
+            // Store hints
+            h_ptr[i..][0..8].* = hint_vals;
+
+            // Accumulate count (reinterpret as unsigned for addition)
+            count +%= @bitCast(hint_vals);
+        }
+
+        // Horizontal sum
+        return @reduce(.Add, count);
+    }
+
     /// Correct high bits according to hint.
     pub fn polyUseHint(b: *Self, a: *const Self, h: *const Self) void {
         for (&b.coeffs, a.coeffs, h.coeffs) |*bc, ac, hc| {
@@ -167,16 +217,65 @@ pub const Poly = struct {
 
     /// Check infinity norm against given bound.
     /// Returns true if norm is strictly smaller than B <= (Q-1)/8.
-    pub fn chknorm(self: *const Self, bound: i32) bool {
+    pub fn chknormScalar(self: *const Self, bound: i32) bool {
         if (bound > (Q - 1) / 8) return false;
 
+        var failed: i32 = 0;
         for (self.coeffs) |c| {
             // Absolute value without leaking sign
             const mask = c >> 31;
             const abs = c - (mask & (2 * c));
-            if (abs >= bound) return false;
+
+            // Check if abs >= bound
+            // This is equivalent to: bound - 1 - abs < 0
+            // If abs >= bound, bound - 1 - abs < 0 -> sign bit 1 -> -1 (all 1s)
+            // If abs < bound, bound - 1 - abs >= 0 -> sign bit 0 -> 0
+            failed |= (bound - 1 - abs) >> 31;
         }
-        return true;
+
+        return failed == 0;
+    }
+
+    pub fn chknorm(self: *const Self, bound: i32) bool {
+        if (bound > (Q - 1) / 8) return false;
+        if (simd.has_simd) {
+            return chknorm_avx(self, bound);
+        } else {
+            return chknormScalar(self, bound);
+        }
+    }
+
+    pub fn chknorm_avx(self: *const Self, bound: i32) bool {
+        if (bound > (Q - 1) / 8) return false;
+        const bound_vec: simd.I32x8 = @splat(bound - 1);
+        const coeffs_ptr: [*]const i32 = &self.coeffs;
+
+        // 4-way unroll for better ILP
+        var f0: simd.I32x8 = @splat(0);
+        var f1: simd.I32x8 = @splat(0);
+        var f2: simd.I32x8 = @splat(0);
+        var f3: simd.I32x8 = @splat(0);
+
+        comptime var i: usize = 0;
+        inline while (i < N) : (i += 32) {
+            inline for (0..4) |j| {
+                const c: simd.I32x8 = coeffs_ptr[i + j * 8 ..][0..8].*;
+                const mask = c >> @splat(31);
+                const abs = (c ^ mask) -% mask;
+                const fail = (bound_vec -% abs) >> @splat(31);
+
+                switch (j) {
+                    0 => f0 |= fail,
+                    1 => f1 |= fail,
+                    2 => f2 |= fail,
+                    3 => f3 |= fail,
+                    else => unreachable,
+                }
+            }
+        }
+
+        const combined = f0 | f1 | f2 | f3;
+        return @reduce(.Or, combined) == 0;
     }
 
     // ==================== Sampling ====================
@@ -302,7 +401,7 @@ pub const Poly = struct {
 
     /// Sample polynomial with uniformly random coefficients in [-(GAMMA1-1), GAMMA1].
     pub fn uniformGamma1(self: *Self, seed: *const [CRHBYTES]u8, nonce: u16) void {
-        const NBLOCKS = (POLYZ_PACKEDBYTES + STREAM256_BLOCKBYTES - 1) / STREAM256_BLOCKBYTES;
+        const NBLOCKS = comptime (POLYZ_PACKEDBYTES + STREAM256_BLOCKBYTES - 1) / STREAM256_BLOCKBYTES;
 
         var buf: [NBLOCKS * STREAM256_BLOCKBYTES]u8 = undefined;
         var state = symmetric.Stream256State.init(seed, nonce);

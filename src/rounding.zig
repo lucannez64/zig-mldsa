@@ -54,7 +54,11 @@ pub fn decompose(a: i32) DecomposeResult {
 ///
 /// Returns true if overflow.
 pub fn makeHint(a0: i32, a1: i32) bool {
-    return a0 > GAMMA2 or a0 < -GAMMA2 or (a0 == -GAMMA2 and a1 != 0);
+    // Constant-time implementation to avoid data-dependent branches
+    const c1 = @intFromBool(a0 > GAMMA2);
+    const c2 = @intFromBool(a0 < -GAMMA2);
+    const c3 = @intFromBool(a0 == -GAMMA2) & @intFromBool(a1 != 0);
+    return (c1 | c2 | c3) != 0;
 }
 
 /// Correct high bits according to hint.
