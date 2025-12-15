@@ -44,7 +44,7 @@ fn run_make_hint_wrapper(ctx: *MakeHintCtx) void {
 }
 
 fn run_sign_wrapper(key: *const packing.SecretKey, msg: []const u8) void {
-    const sig = sign_mod.sign(key, msg, "");
+    const sig = sign_mod.sign(key, msg, "", null) catch unreachable;
     std.mem.doNotOptimizeAway(sig);
 }
 
@@ -295,7 +295,7 @@ pub fn main() !void {
         std.crypto.random.bytes(&msg);
 
         // Generate a valid signature
-        const sig_valid = sign_mod.sign(&kp.secret_key, &msg, "") catch unreachable;
+        const sig_valid = sign_mod.sign(&kp.secret_key, &msg, "", null) catch unreachable;
 
         // Generate an invalid signature (flip last byte)
         var sig_invalid = sig_valid;

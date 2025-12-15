@@ -4,6 +4,7 @@
 const std = @import("std");
 const params = @import("params.zig");
 const poly_mod = @import("poly.zig");
+const symmetric = @import("symmetric.zig");
 
 const K = params.K;
 const L = params.L;
@@ -253,45 +254,50 @@ pub const Mat = struct {
     }
 };
 
-/// Process 4 polynomials in parallel using interleaved SHAKE128 states.
+/// Process 4 polynomials in parallel using 4-way SHAKE128
 fn uniformX4(
     polys: [4]*Poly,
     rho: *const [SEEDBYTES]u8,
     nonces: [4]u16,
 ) void {
-    // Initialize 4 SHAKE128 states
-    var states: [4]std.crypto.hash.sha3.Shake128 = undefined;
-    for (0..4) |k| {
-        states[k] = std.crypto.hash.sha3.Shake128.init(.{});
-        states[k].update(rho);
-        states[k].update(std.mem.asBytes(&nonces[k]));
-    }
+    // Number of blocks to squeeze at once (5 blocks = 840 bytes ≈ 280 candidates)
+    const NBLOCKS = 5;
+    const BUFLEN = NBLOCKS * symmetric.Shake128x4.RATE;
 
-    // Larger buffer reduces squeeze overhead - 840 bytes = 280 coefficients worth
-    const BUFLEN = 840;
+    var state = symmetric.Shake128x4.init(rho, nonces);
+
     var bufs: [4][BUFLEN]u8 = undefined;
     var positions: [4]usize = .{ BUFLEN, BUFLEN, BUFLEN, BUFLEN };
     var coeff_counts: [4]usize = .{ 0, 0, 0, 0 };
 
-    // Track which polynomials are done
     var done: u4 = 0;
 
     while (done != 0xF) {
-        // Squeeze new bytes for states that need them
+        // Check if any state needs more bytes
+        var need_squeeze = false;
         for (0..4) |k| {
-            if ((done >> @intCast(k)) & 1 == 0 and positions[k] >= BUFLEN - 2) {
-                states[k].squeeze(&bufs[k]);
-                positions[k] = 0;
+            if ((done >> @intCast(k)) & 1 == 0 and positions[k] + 3 > BUFLEN) {
+                need_squeeze = true;
+                break;
             }
         }
 
-        // Process bytes in batches using SIMD extraction
+        // Squeeze all 4 states in parallel (even if some are done)
+        if (need_squeeze) {
+            state.squeezeNBlocks(NBLOCKS, &bufs);
+            for (0..4) |k| {
+                if ((done >> @intCast(k)) & 1 == 0) {
+                    positions[k] = 0;
+                }
+            }
+        }
+
+        // Process each polynomial's buffer
         for (0..4) |k| {
             if ((done >> @intCast(k)) & 1 == 1) continue;
 
             const remaining_coeffs = params.N - coeff_counts[k];
             const remaining_bytes = BUFLEN - positions[k];
-            // Each coefficient needs 3 bytes
             const batch_size = @min(remaining_bytes / 3, remaining_coeffs);
 
             const accepted = extractCoeffsBatch(

@@ -115,7 +115,7 @@ const keccak4x = @import("keccak4x.zig");
 /// Parallel SHAKE256 state for 4 streams.
 /// Parallel SHAKE256 state for 4 streams.
 pub const Stream256x4State = struct {
-    state: keccak4x.State4x,
+    state: keccak4x.KeccakF1600x4,
     offset: usize = 0, // Byte offset in the current block (same for all lanes)
 
     const Self = @This();
@@ -235,7 +235,7 @@ pub const Stream256x4State = struct {
 
 /// Parallel SHAKE128 state for 4 streams.
 pub const Stream128x4State = struct {
-    state: keccak4x.State4x,
+    state: keccak4x.KeccakF1600x4,
     offset: usize = 0, // Byte offset in the current block (same for all lanes)
 
     const Self = @This();
@@ -316,7 +316,66 @@ pub const Stream128x4State = struct {
         }
 
         // Permute for next block
-        keccak4x.keccakF1600_4x(&self.state);
+        self.state.permute();
+    }
+};
+
+pub const Shake128x4 = struct {
+    keccak: keccak4x.KeccakF1600x4 = .{},
+    offset: usize = 0, // Byte offset in the current block (same for all lanes)
+    pub const RATE = SHAKE128_RATE;
+    const RATE_LANES = RATE / 8; // 21 lanes
+    pub fn init(rho: *const [32]u8, nonces: [4]u16) @This() {
+        var self: @This() = .{};
+        var blocks: [4][RATE]u8 = [_][RATE]u8{[_]u8{0} ** RATE} ** 4;
+        for (0..4) |k| {
+            @memcpy(blocks[k][0..SEEDBYTES], rho);
+            std.mem.writeInt(u16, blocks[k][SEEDBYTES..][0..2], nonces[k], .little);
+            // SHAKE padding: 0x1F at end of message, 0x80 at end of rate block
+            blocks[k][SEEDBYTES + 2] = 0x1F;
+            blocks[k][RATE - 1] |= 0x80;
+        }
+
+        // XOR blocks into interleaved state
+        for (0..RATE_LANES) |i| {
+            var lane: @Vector(4, u64) = @splat(0);
+            for (0..4) |k| {
+                lane[k] = std.mem.readInt(u64, blocks[k][i * 8 ..][0..8], .little);
+            }
+            self.keccak.s[i] = lane;
+        }
+
+        self.keccak.permute();
+        return self;
+    }
+
+    pub fn squeezeBlocks(self: @This(), out: *[4][*]u8) void {
+        // Extract rate bytes from each state
+        for (0..RATE_LANES) |i| {
+            const lane = self.keccak.state[i];
+            inline for (0..4) |k| {
+                std.mem.writeInt(u64, out[k][i * 8 ..][0..8], lane[k], .little);
+            }
+        }
+        self.keccak.permute();
+    }
+
+    /// Squeeze multiple blocks at once
+    pub fn squeezeNBlocks(self: *@This(), comptime N: usize, out: *[4][N * RATE]u8) void {
+        inline for (0..N) |block| {
+            for (0..RATE_LANES) |i| {
+                const lane = self.keccak.s[i];
+                inline for (0..4) |k| {
+                    std.mem.writeInt(
+                        u64,
+                        out[k][block * RATE + i * 8 ..][0..8],
+                        lane[k],
+                        .little,
+                    );
+                }
+            }
+            self.keccak.permute();
+        }
     }
 };
 

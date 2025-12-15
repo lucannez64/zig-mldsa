@@ -6,8 +6,69 @@ pub const U64x4 = @Vector(4, u64);
 
 /// Keccak-f[1600] state containing 4 parallel states.
 /// 25 lanes, each lane is a 4-element vector of u64.
-pub const State4x = struct {
-    s: [25]U64x4,
+pub const KeccakF1600x4 = struct {
+    s: [25]U64x4 align(32) = [_]U64x4{@splat(0)} ** 25,
+    pub fn permute(self: *@This()) void {
+        @setEvalBranchQuota(10000);
+        var s = &self.s;
+        inline for (round_constants) |rc| {
+            // Theta
+            var c: [5]U64x4 = undefined;
+            var d: [5]U64x4 = undefined;
+
+            inline for (0..5) |i| {
+                c[i] = s[i] ^ s[i + 5] ^ s[i + 10] ^ s[i + 15] ^ s[i + 20];
+            }
+
+            inline for (0..5) |i| {
+                d[i] = c[(i + 4) % 5] ^ rol(c[(i + 1) % 5], 1);
+            }
+
+            inline for (0..25) |i| {
+                s[i] ^= d[i % 5];
+            }
+
+            // Rho + Pi
+            // We need a temporary buffer because Pi permutes positions
+            var b: [25]U64x4 = undefined;
+            inline for (0..5) |y| {
+                inline for (0..5) |x| {
+                    const index = x + 5 * y;
+                    b[y + 5 * ((2 * x + 3 * y) % 5)] = rol(s[index], rho_offsets[index]);
+                }
+            }
+
+            // Chi
+            inline for (0..5) |y| {
+                const row = y * 5;
+
+                // Load entire row into registers (5 vector loads)
+                const b0 = b[row + 0];
+                const b1 = b[row + 1];
+                const b2 = b[row + 2];
+                const b3 = b[row + 3];
+                const b4 = b[row + 4];
+
+                // Precompute negations (vectorized across 4 lanes)
+                const not_b0 = ~b0;
+                const not_b1 = ~b1;
+                const not_b2 = ~b2;
+                const not_b3 = ~b3;
+                const not_b4 = ~b4;
+
+                // Compute Chi with explicit unrolling - no modulo ops
+                // Each: 1 vector AND, 1 vector XOR
+                s[row + 0] = b0 ^ (not_b1 & b2);
+                s[row + 1] = b1 ^ (not_b2 & b3);
+                s[row + 2] = b2 ^ (not_b3 & b4);
+                s[row + 3] = b3 ^ (not_b4 & b0);
+                s[row + 4] = b4 ^ (not_b0 & b1);
+            }
+
+            // Iota
+            s[0] ^= @as(U64x4, @splat(rc));
+        }
+    }
 };
 
 /// Round constants for Keccak-f[1600]
@@ -38,46 +99,4 @@ inline fn rol(x: U64x4, comptime n: u6) U64x4 {
     }
     const shift: u64 = n;
     return (x << @splat(shift)) | (x >> @splat(64 - shift));
-}
-
-pub fn keccakF1600_4x(state: *State4x) void {
-    @setEvalBranchQuota(10000);
-    inline for (round_constants) |rc| {
-        // Theta
-        var c: [5]U64x4 = undefined;
-        var d: [5]U64x4 = undefined;
-
-        inline for (0..5) |i| {
-            c[i] = state.s[i] ^ state.s[i + 5] ^ state.s[i + 10] ^ state.s[i + 15] ^ state.s[i + 20];
-        }
-
-        inline for (0..5) |i| {
-            d[i] = c[(i + 4) % 5] ^ rol(c[(i + 1) % 5], 1);
-        }
-
-        inline for (0..25) |i| {
-            state.s[i] ^= d[i % 5];
-        }
-
-        // Rho + Pi
-        // We need a temporary buffer because Pi permutes positions
-        var b: [25]U64x4 = undefined;
-        inline for (0..5) |y| {
-            inline for (0..5) |x| {
-                const index = x + 5 * y;
-                b[y + 5 * ((2 * x + 3 * y) % 5)] = rol(state.s[index], rho_offsets[index]);
-            }
-        }
-
-        // Chi
-        inline for (0..5) |y| {
-            inline for (0..5) |x| {
-                const index = x + 5 * y;
-                state.s[index] = b[index] ^ ((~b[(x + 1) % 5 + 5 * y]) & b[(x + 2) % 5 + 5 * y]);
-            }
-        }
-
-        // Iota
-        state.s[0] ^= @as(U64x4, @splat(rc));
-    }
 }
