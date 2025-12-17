@@ -303,7 +303,7 @@ test "NIST KAT SigVer" {
         std.debug.print("Running SigVer KATs for {s} (tgId: {d})...\n", .{ group.parameterSet, group.tgId });
 
         for (group.tests) |tc| {
-            // std.debug.print("tc: {}\n", .{tc.tcId});
+
 
             // TODO: Investigate why these test cases fail verification despite valid context length
             if (tc.tcId == 31 or tc.tcId == 35 or tc.tcId == 37) {

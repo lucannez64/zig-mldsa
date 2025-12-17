@@ -300,7 +300,6 @@ fn signInternal(
         var w0: PolyVecK = .{};
         PolyVecK.decompose(&w1, &w0, &w1);
 
-        // In signInternal function:
         var w1_packed: [@as(usize, K) * POLYW1_PACKEDBYTES]u8 = undefined;
         w1.packW1(&w1_packed);
 

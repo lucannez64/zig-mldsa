@@ -159,7 +159,6 @@ pub const Poly = struct {
         return s;
     }
     /// Compute hint polynomial. Returns number of 1 bits.
-    /// Compute hint polynomial (SIMD). Returns number of 1 bits.
     pub fn polyMakeHint(h: *Poly, a0: *const Poly, a1: *const Poly) u32 {
         if (!simd.has_simd) {
             return polyMakeHintScalar(h, a0, a1);

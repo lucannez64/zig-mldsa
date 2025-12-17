@@ -1,4 +1,4 @@
-(* Auto-generated Coq definitions from zgg implementation *)
+(* Dilithium Parameter Definitions *)
 Require Import ZArith.
 
 Module DilithiumParams.

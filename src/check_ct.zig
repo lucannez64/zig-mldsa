@@ -305,14 +305,7 @@ pub fn main() !void {
 
         for (0..num_measurements) |i| {
             // We use fixed key and msg, but vary the signature validity.
-            // To avoid branch prediction learning "always valid" or "always invalid", we mix them.
-            // However, dudect relies on the fact that we are measuring TWO classes.
-
-            // Ideally we should vary the message too, to ensure we exercise different paths in hashing?
-            // But keeping key fixed is fine.
-            // Let's vary the message slightly? No, then we need to re-sign.
-            // Re-signing is slow.
-            // So we stick to fixed message/key, and valid vs invalid signature.
+            // We mix valid and invalid signatures to avoid branch prediction learning.
 
             const class = random.int(u1);
             var cycles: u64 = 0;

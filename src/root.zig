@@ -496,9 +496,6 @@ test "KAT: public key determinism check" {
         if (b != 0) all_zero = false;
     }
     try std.testing.expect(!all_zero);
-
-    // Log the hash for manual verification during development
-    // std.debug.print("PK hash prefix: {x}\n", .{hash_prefix.*});
 }
 
 test {
