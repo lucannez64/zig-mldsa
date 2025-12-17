@@ -65,51 +65,51 @@ pub fn main() !void {
     // Use crypto random
     const random = std.crypto.random;
 
-    // // Test 1: NTT
-    // {
-    //     var d = dudect.Dudect.init("poly_ntt");
+    // Test 1: NTT
+    {
+        var d = dudect.Dudect.init("poly_ntt");
 
-    //     std.debug.print("Warming up NTT...\n", .{});
-    //     var dummy: [N]i32 = undefined;
-    //     for (0..1000) |_| {
-    //         ntt_mod.ntt(&dummy);
-    //     }
+        std.debug.print("Warming up NTT...\n", .{});
+        var dummy: [N]i32 = [_]i32{0} ** N;
+        for (0..1000) |_| {
+            ntt_mod.ntt(&dummy);
+        }
 
-    //     std.debug.print("Starting measurements for {s}...\n", .{d.name});
+        std.debug.print("Starting measurements for {s}...\n", .{d.name});
 
-    //     const num_measurements = 50000;
+        const num_measurements = 50000;
 
-    //     var input0: [N]i32 = [_]i32{0} ** N;
-    //     var input1: [N]i32 = undefined;
+        var input0: [N]i32 = [_]i32{0} ** N;
+        var input1: [N]i32 = undefined;
 
-    //     for (0..num_measurements) |i| {
-    //         for (0..N) |j| {
-    //             input1[j] = @as(i32, random.int(i16));
-    //         }
+        for (0..num_measurements) |i| {
+            for (0..N) |j| {
+                input1[j] = @as(i32, random.int(i16));
+            }
 
-    //         const class = random.int(u1);
+            const class = random.int(u1);
 
-    //         var cycles: u64 = 0;
-    //         if (class == 0) {
-    //             cycles = dudect.measure_cycles(run_ntt_wrapper, .{&input0});
-    //         } else {
-    //             cycles = dudect.measure_cycles(run_ntt_wrapper, .{&input1});
-    //         }
+            var cycles: u64 = 0;
+            if (class == 0) {
+                cycles = dudect.measure_cycles(run_ntt_wrapper, .{&input0});
+            } else {
+                cycles = dudect.measure_cycles(run_ntt_wrapper, .{&input1});
+            }
 
-    //         d.push(class, cycles);
+            d.push(class, cycles);
 
-    //         if (i % 10000 == 0 and i > 0) {
-    //             const t = d.t_value();
-    //             std.debug.print("Iter {d}: t-value = {d:.4}\n", .{ i, t });
-    //         }
-    //     }
+            if (i % 10000 == 0 and i > 0) {
+                const t = d.t_value();
+                std.debug.print("Iter {d}: t-value = {d:.4}\n", .{ i, t });
+            }
+        }
 
-    //     const t = d.t_value();
-    //     std.debug.print("Final NTT t-value: {d:.4}\n", .{t});
-    //     if (@abs(t) > 5.0) {
-    //         std.debug.print("POTENTIAL TIMING LEAK IN NTT!\n", .{});
-    //     }
-    // }
+        const t = d.t_value();
+        std.debug.print("Final NTT t-value: {d:.4}\n", .{t});
+        if (@abs(t) > 5.0) {
+            std.debug.print("POTENTIAL TIMING LEAK IN NTT!\n", .{});
+        }
+    }
 
     // Test 2: Chknorm
     {

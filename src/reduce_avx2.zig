@@ -80,6 +80,22 @@ pub inline fn lazyReduce(x: I32x8) I32x8 {
     return @select(i32, mask, reduced, x);
 }
 
+test "reduce_avx2 montgomery large" {
+    const reduce_scalar = @import("reduce.zig");
+
+    // Test with larger values (product of Q-sized numbers)
+    // Q approx 8e6. Q*Q approx 64e12. i64 max is 9e18.
+    const large: i64 = 64_000_000_000_000;
+    const test_vals: [8]i64 = .{ large, -large, large * 2, -large * 2, large / 2, -large / 2, 0, -1 };
+    const vec_result = montgomeryReduce8(test_vals);
+    const result_arr: [8]i32 = vec_result;
+
+    for (0..8) |i| {
+        const scalar_result = reduce_scalar.montgomeryReduce(test_vals[i]);
+        try std.testing.expectEqual(scalar_result, result_arr[i]);
+    }
+}
+
 test "reduce_avx2 montgomery" {
     const reduce_scalar = @import("reduce.zig");
 

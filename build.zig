@@ -161,6 +161,46 @@ pub fn build(b: *std.Build) void {
     const bench_install_step = b.step("bench-install", "Install benchmarks");
     const bench_install_cmd = b.addInstallArtifact(bench_exe, .{});
     bench_install_step.dependOn(&bench_install_cmd.step);
+
+    // Check Constant Time step
+    const check_ct_exe = b.addExecutable(.{
+        .name = "check_ct",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/check_ct.zig"),
+            .target = target,
+            // Dudect relies on timing, so ReleaseFast is probably better to avoid debug overhead masking timing leaks,
+            // but we also want to avoid over-optimization removing the code we want to measure (though doNotOptimizeAway helps).
+            // Let's use ReleaseFast as it's closer to production builds.
+            // Actually, ReleaseSafe is default for tests. Let's stick to what the user likely uses.
+            // But timing attacks are often about optimized code.
+            // Let's use optimize option passed by user.
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zgg", .module = mod },
+            },
+        }),
+    });
+
+    const run_check_ct = b.addRunArtifact(check_ct_exe);
+    const check_ct_step = b.step("check-ct", "Run constant-time checks");
+    check_ct_step.dependOn(&run_check_ct.step);
+
+    // NIST KAT step
+    const kat_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nist_kat.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zgg", .module = mod },
+            },
+        }),
+    });
+
+    const run_kat_tests = b.addRunArtifact(kat_tests);
+    const check_kat_step = b.step("check-kat", "Run NIST Known Answer Tests");
+    check_kat_step.dependOn(&run_kat_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
